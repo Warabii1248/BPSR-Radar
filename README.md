@@ -2,6 +2,8 @@
 
 [English](#english) | [日本語](#日本語)
 
+<img src="docs/screenshot.png" alt="BPSR-Radar のレーダーとターゲット表示" width="386">
+
 ## 日本語
 
 BLUE PROTOCOL: Star Resonance 用のスタンドアロン ミニマップ / ロックオンターゲット オーバーレイです。
