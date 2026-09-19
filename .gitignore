@@ -1,0 +1,33 @@
+# Build output
+bin/
+obj/
+out/
+publish/
+publish-staging/
+
+# Visual Studio / Rider
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Runtime artifacts
+*.log
+
+# Test helper builds
+helper-test*/
+
+# Distribution packages (kept local, not tracked)
+BPSR-Radar-v*-win-x64.zip
+
+# Offline harness recordings (pcap / packet index / memory snapshots).
+# A single session is several GB; these stay local.
+records/
+*.pcap
+packets.tsv
+snap-*.bin
