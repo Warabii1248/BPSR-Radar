@@ -36,6 +36,18 @@ interface IMemSource
 
     bool Read(ulong addr, byte[] buffer, int length, out int read);
 
+    // Where the next readable byte at or after `addr` is. False when the
+    // source cannot answer, and the caller steps a page instead.
+    //
+    // A failed read says nothing about how far the damage extends, and both
+    // ways of guessing are bad. Stepping one page per failed syscall walked a
+    // freed 400 MiB region in 15.2 seconds of a scan that normally takes one
+    // (measured 2026-09-19, skipped=98416). Striding past it in wider jumps
+    // is fast but skips live memory -- up to 60 KiB of it -- which may be
+    // exactly where the record sits. The live source does not have to guess:
+    // VirtualQueryEx answers in one call.
+    bool TryNextReadable(ulong addr, out ulong next);
+
     string Describe { get; }
 }
 
@@ -73,14 +85,50 @@ sealed class LiveMem : IMemSource
 
     public bool Read(ulong addr, byte[] buffer, int length, out int read)
     {
-        bool ok = Native.ReadProcessMemory(handle, (IntPtr)addr, buffer, length, out nint n);
+        // A partial copy is a success for our purposes. ReadProcessMemory
+        // returns FALSE with ERROR_PARTIAL_COPY when the range runs into
+        // unreadable memory part way, but it still fills in everything up to
+        // that point -- and the old `ok && n > 0` threw all of it away. With
+        // a 4 MiB request, one bad page near the end discarded almost four
+        // megabytes of perfectly readable memory, every chunk, every scan.
+        // The caller already works off `read` rather than the length it
+        // asked for.
+        Native.ReadProcessMemory(handle, (IntPtr)addr, buffer, length, out nint n);
         read = (int)n;
-        return ok && n > 0;
+        return n > 0;
+    }
+
+    public bool TryNextReadable(ulong addr, out ulong next)
+    {
+        next = 0;
+        ulong probe = addr;
+        // Bounded. A pathological address space must not turn one failed
+        // read into an unbounded walk of the region list.
+        for (int i = 0; i < 64; i++)
+        {
+            nint r = Native.VirtualQueryEx(handle, (IntPtr)probe, out var mbi,
+                (nuint)Marshal.SizeOf<Native.MEMORY_BASIC_INFORMATION64>());
+            if (r == 0 || mbi.RegionSize == 0) return false;
+            // privateOnly matches how Find enumerated in the first place: if
+            // the range stopped being private heap it is not ours to scan.
+            if (IsReadable(mbi, privateOnly: true))
+            {
+                next = Math.Max(addr, mbi.BaseAddress);
+                return true;
+            }
+            ulong after = mbi.BaseAddress + mbi.RegionSize;
+            if (after <= probe) return false;
+            probe = after;
+        }
+        return false;
     }
 }
 
 sealed class SnapshotMem : IMemSource, IDisposable
 {
+    // A snapshot has no live page tables to consult; the caller steps.
+    public bool TryNextReadable(ulong addr, out ulong next) { next = 0; return false; }
+
     private readonly List<(ulong Base, ulong Size)> regions;
     private ulong[] blockAddrs = Array.Empty<ulong>();
     private byte[][] blockData = Array.Empty<byte[]>();

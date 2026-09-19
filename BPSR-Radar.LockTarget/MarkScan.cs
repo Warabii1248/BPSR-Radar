@@ -109,7 +109,7 @@ static class MarkScan
                     // or if capture is down, and a sweep that silently records
                     // nothing is worse than one that records a little extra.
                     bool confirmed = known.Has(v);
-                    if (!confirmed && !UuidShape.IsMonster(v)) continue;
+                    if (!confirmed && !UuidShape.IsLockable(v)) continue;
                     ulong addr = b + pos + (ulong)off;
                     // Shape alone lets bit patterns through: one sweep held
                     // 0x4000000040 seventy thousand times. The flag lets the

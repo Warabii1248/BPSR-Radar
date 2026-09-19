@@ -1,3 +1,4 @@
+using System.Linq;
 using Google.Protobuf.Collections;
 using System.Collections.Concurrent;
 using System.IO;
@@ -156,8 +157,20 @@ internal static class RadarTracker
 
     public static long PositionDirectionCount => Interlocked.Read(ref positionDirectionCount);
 
+    // When the scene last changed, in unix ms. Zero until the first one.
+    public static long SceneChangedAtMs { get; private set; }
+
+    // Published to the helper. It cannot see packets, so without this it has
+    // no way to know the world was rebuilt under the record it is watching.
+    public static uint CurrentSceneId { get { lock (Sync) { return sceneId; } } }
+
     public static void SetScene(uint newSceneId)
     {
+        // A local, not a field: two threads calling SetScene would otherwise
+        // lose one line and print the other twice. Only one packet thread
+        // exists today, which is exactly the kind of assumption that stops
+        // being true quietly.
+        string? line = null;
         lock (Sync)
         {
             if (sceneId == newSceneId)
@@ -165,6 +178,7 @@ internal static class RadarTracker
                 return;
             }
 
+            uint sceneIdBefore = sceneId;
             sceneId = newSceneId;
             sceneName = GameDataTables.Scenes.TryGetValue((int)newSceneId, out var scene) ? scene.Name : "";
             lock (DirectionLock)
@@ -172,11 +186,34 @@ internal static class RadarTracker
                 Interlocked.Exchange(ref positionDirectionCount, 0);
                 lastPositionDirection = 0;
             }
+            // Recorded before the wipe, because what it wipes is the
+            // question. If an AOI batch for the new scene arrives before this
+            // notification does -- and it can, SetScene is driven by a social
+            // packet that merely carries SceneData, not by the scene load --
+            // then everything it just delivered is discarded here, and a
+            // static entity like a training dummy never re-announces itself.
+            int cleared = Entities.Count;
+            int clearedLockable = 0;
+            foreach (var e in Entities.Values)
+            {
+                if (e.EntityType == EEntityType.EntMonster) clearedLockable++;
+            }
             Entities.Clear();
             lastPartyBatchTimestamp = 0;
             partyExpiry = MinimumPartyExpiry;
             hasSnapshot = false;
+            line = $"scene {sceneIdBefore}->{newSceneId} cleared={cleared} mon={clearedLockable}";
+            // Read by EntityExport. Clearing the list here is what strands the
+            // memory helper after a field transition: it cannot re-adopt the
+            // record or scan for it until the exported list names a monster
+            // again, so for the next few seconds that file is on the critical
+            // path and is written more often.
+            SceneChangedAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         }
+
+        // Outside the lock: this one appends to a file, and Sync is taken by
+        // the UI snapshot ten times a second.
+        if (line != null) TrackerLog.Write(line);
     }
 
     public static void SetSelf(long uuid)
@@ -831,10 +868,55 @@ internal static class RadarTracker
         return n;
     }
 
+    // A one-line census of what the packet side currently believes exists,
+    // by EEntityType. This is the other half of the guild hall question: the
+    // helper reported known=58/mon=0 and there was no way to see afterwards
+    // what those 58 were, because entities.json is overwritten every second
+    // and keeps no history.
+    // Caller holds Sync.
+    private static string CensusLocked()
+    {
+        var counts = new SortedDictionary<int, int>();
+        int lockable = 0;
+        foreach (var e in Entities.Values)
+        {
+            int t = (int)e.EntityType;
+            counts[t] = counts.TryGetValue(t, out int n) ? n + 1 : 1;
+            if (e.EntityType == EEntityType.EntMonster) lockable++;
+        }
+        return $"entities n={Entities.Count} mon={lockable} scene={sceneId} "
+             + $"types=[{string.Join(" ", counts.Select(kv => $"{kv.Key}:{kv.Value}"))}]";
+    }
+
+    // Scene id and entity list in one lock. Sampling them separately let a
+    // scene change land between the two, publishing the old scene id beside
+    // the new scene's freshly cleared list -- which tells the helper the
+    // world has not changed at the exact moment it has, defeating the field
+    // that exists to tell it. Census is taken here too, so the line the log
+    // gets describes the same instant.
+    public static (uint Scene, List<EntityExportRecord> Entities) ExportLiveSnapshot()
+    {
+        string census;
+        uint scene;
+        List<EntityExportRecord> list;
+        lock (Sync)
+        {
+            scene = sceneId;
+            census = CensusLocked();
+            list = ExportLocked();
+        }
+        TrackerLog.Composition(census);
+        return (scene, list);
+    }
+
     public static List<EntityExportRecord> ExportLiveEntities()
     {
+        return ExportLiveSnapshot().Entities;
+    }
+
+    private static List<EntityExportRecord> ExportLocked()
+    {
         var list = new List<EntityExportRecord>();
-        lock (Sync)
         {
             foreach (var e in Entities.Values)
             {

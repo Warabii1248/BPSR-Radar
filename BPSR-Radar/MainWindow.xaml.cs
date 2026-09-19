@@ -97,6 +97,13 @@ public partial class MainWindow : Window
         refreshTimer.Tick += (_, _) => Refresh();
         refreshTimer.Start();
 
+        // The timer still drives the radar, which is fed by 100ms packet
+        // snapshots and has nothing to gain from running faster. The lock
+        // target does: it can change several times a second while the player
+        // cycles through a pull, and waiting for the next tick was the last
+        // sampling delay in the chain. So it arrives as an event instead.
+        LockTargetService.TargetChanged += OnTargetChanged;
+
         settingsSaveTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
         settingsSaveTimer.Tick += (_, _) =>
         {
@@ -305,6 +312,22 @@ public partial class MainWindow : Window
     private void Fit_Click(object sender, RoutedEventArgs e)
     {
         RadarSettings.Instance.Zoom = 1f;
+    }
+
+    // Raised from the capture thread and from the lock-target service loop,
+    // so it has to hop to the UI thread before touching anything. Only the
+    // target-dependent parts are redrawn: the rest of Refresh reads a packet
+    // snapshot that has not moved.
+    private void OnTargetChanged()
+    {
+        if (!Dispatcher.CheckAccess())
+        {
+            try { Dispatcher.BeginInvoke(new Action(OnTargetChanged)); } catch { }
+            return;
+        }
+        targetOverlay?.SetText(LockTargetService.StatusText, LockTargetService.TargetIsStrong);
+        MapCanvas.LockTargetUuid = LockTargetService.CurrentTargetUuid;
+        MapCanvas.InvalidateVisual();
     }
 
     private void Refresh()
@@ -560,6 +583,9 @@ public partial class MainWindow : Window
     protected override void OnClosed(EventArgs e)
     {
         refreshTimer.Stop();
+        // The service is static and outlives the window during shutdown, so
+        // an event left attached would keep dispatching into a closed one.
+        LockTargetService.TargetChanged -= OnTargetChanged;
         targetOverlay?.Close();
         clickThroughGuard?.Close();
         var hwnd = new WindowInteropHelper(this).Handle;

@@ -37,8 +37,9 @@ BLUE PROTOCOL: Star Resonance 用のスタンドアロン ミニマップ / ロ�
   `%LOCALAPPDATA%\BPSR-Radar\settings.json` の `LockKeyVk` に
   [仮想キーコード](https://learn.microsoft.com/windows/win32/inputdev/virtual-key-codes)
   を10進で設定してください（`0` で無効）。設定しなくても表示はされますが、
-  場所を移った直後の初回表示が数秒早くなります。コントローラーの場合は `0` のままで
-  問題ありません。
+  **設定しておくことを勧めます**: 場所を移った直後の初回表示が早くなるほか、
+  ロックしたのに表示が出なかったときの自動復帰がこのキーを見て働きます。
+  コントローラーの場合は `0` のままで問題ありません。
 
 ### 注意事項
 
@@ -83,9 +84,10 @@ app itself.
 - If your lock-on key is not the default (middle mouse button), set `LockKeyVk`
   in `%LOCALAPPDATA%\BPSR-Radar\settings.json` to its
   [virtual-key code](https://learn.microsoft.com/windows/win32/inputdev/virtual-key-codes)
-  in decimal, or `0` to switch it off. The target still appears without it; the
-  setting only makes the first lock after changing area show up a few seconds
-  sooner. Leave it at `0` if you play on a controller.
+  in decimal, or `0` to switch it off. The target still appears without it, but
+  setting it is recommended: as well as making the first lock after a zone
+  change show up sooner, it is what lets the overlay notice that a lock you
+  made did not appear, and go looking for it. Leave it at `0` on a controller.
 
 ### Notes
 
