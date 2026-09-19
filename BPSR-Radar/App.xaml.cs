@@ -70,6 +70,31 @@ public partial class App : Application
         GameDataTables.Load();
         RadarTracker.LoadNameCache();
 
+        // --check <file>: confirm the packaged build can find its data, then
+        // exit. A missing table is silent -- LoadTable returns an empty
+        // dictionary and the app starts normally, showing "#1234" instead of
+        // every name -- so packaging changes need something that fails loudly.
+        // Exists because single-file publishing moves what
+        // AppContext.BaseDirectory means, and the tables are read through it.
+        if (Array.IndexOf(e.Args, "--check") is int ci and >= 0)
+        {
+            string report =
+                $"monsters={GameDataTables.Monsters.Count} " +
+                $"dummies={GameDataTables.Dummys.Count} " +
+                $"scenes={GameDataTables.Scenes.Count} " +
+                $"base={AppContext.BaseDirectory}";
+            bool ok = GameDataTables.Monsters.Count > 0
+                && GameDataTables.Dummys.Count > 0
+                && GameDataTables.Scenes.Count > 0;
+            if (ci + 1 < e.Args.Length)
+            {
+                try { System.IO.File.WriteAllText(e.Args[ci + 1], (ok ? "OK " : "FAIL ") + report); }
+                catch { }
+            }
+            Shutdown(ok ? 0 : 1);
+            return;
+        }
+
         Serilog.Log.Logger = new Serilog.LoggerConfiguration()
             .MinimumLevel.Debug()
             .CreateLogger();

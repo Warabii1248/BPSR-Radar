@@ -11,7 +11,8 @@ BLUE PROTOCOL: Star Resonance 用のスタンドアロン ミニマップ / ロ�
 [Releases](https://github.com/Warabii1248/BPSR-Radar/releases) から最新の
 `BPSR-Radar-*.zip` をダウンロードし、任意のフォルダに展開して
 `BPSR-Radar.exe` を実行してください。インストーラや .NET ランタイムは
-不要です。
+不要です。展開後の中身は実行ファイル2つと `Data` フォルダだけです
+（`BPSR-Radar.LockTarget.exe` はロックオン表示用で、本体から自動で起動されます）。
 
 ### 必要環境
 
@@ -57,7 +58,9 @@ Standalone minimap / lock-on target overlay for BLUE PROTOCOL: Star Resonance.
 Get the latest `BPSR-Radar-*.zip` from
 [Releases](https://github.com/Warabii1248/BPSR-Radar/releases), extract it
 anywhere, and run `BPSR-Radar.exe`. No installer and no .NET runtime are
-required.
+required. What you unpack is two executables and a `Data` folder;
+`BPSR-Radar.LockTarget.exe` serves the lock-on display and is started by the
+app itself.
 
 ### Requirements
 

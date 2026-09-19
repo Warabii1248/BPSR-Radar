@@ -11,6 +11,19 @@
     <CetCompat>false</CetCompat>
     <Version>0.1.4</Version>
     <InformationalVersion>0.1.4</InformationalVersion>
+
+    <!-- One executable instead of 265 loose files beside it. A player
+         unpacking the release should see what to run without hunting. -->
+    <PublishSingleFile>true</PublishSingleFile>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <!-- Only English satellite resources: the other thirteen language
+         folders come from dependencies, are never shown, and are most of
+         what is left beside the executable. -->
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <DebugType>none</DebugType>
   </PropertyGroup>
 
   <ItemGroup>
@@ -22,14 +35,19 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Loaded at runtime from AppContext.BaseDirectory/Data, so these stay
+         loose beside the executable instead of going inside the bundle. -->
     <None Include="..\Data\MonsterTable.json" Link="Data\MonsterTable.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
     </None>
     <None Include="..\Data\DummyTable.json" Link="Data\DummyTable.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
     </None>
     <None Include="..\Data\SceneTable.json" Link="Data\SceneTable.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
     </None>
   </ItemGroup>
 

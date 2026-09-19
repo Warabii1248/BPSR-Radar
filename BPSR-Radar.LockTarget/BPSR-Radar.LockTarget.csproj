@@ -7,6 +7,18 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>BPSR-Radar.LockTarget</AssemblyName>
     <InvariantGlobalization>true</InvariantGlobalization>
+
+    <!-- Same reason as the app: the release should be a short list. -->
+    <PublishSingleFile>true</PublishSingleFile>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <!-- Only English satellite resources: the other thirteen language
+         folders come from dependencies, are never shown, and are most of
+         what is left beside the executable. -->
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <DebugType>none</DebugType>
   </PropertyGroup>
 
 </Project>
