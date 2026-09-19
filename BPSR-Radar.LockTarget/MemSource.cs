@@ -48,6 +48,19 @@ interface IMemSource
     // VirtualQueryEx answers in one call.
     bool TryNextReadable(ulong addr, out ulong next);
 
+    // Which of the `pages` pages starting at `addr` the target already has in
+    // its working set. False when the source cannot tell, and the caller
+    // reads everything -- the old behaviour.
+    //
+    // This exists because reading is not free for the process being read.
+    // ReadProcessMemory faults each page it touches into the TARGET's working
+    // set and it does not leave on its own: measured 2026-09-19, a full scan
+    // took the game from 5,587 MiB resident to 12,752 MiB in one pass, which
+    // is what a player sees in Task Manager. Pages that are already resident
+    // cost nothing to read, so a pass restricted to them cannot inflate
+    // anything, whatever it reads.
+    bool TryResidency(ulong addr, int pages, bool[] resident) => false;
+
     string Describe { get; }
 }
 
@@ -96,6 +109,28 @@ sealed class LiveMem : IMemSource
         Native.ReadProcessMemory(handle, (IntPtr)addr, buffer, length, out nint n);
         read = (int)n;
         return n > 0;
+    }
+
+    // PSAPI_WORKING_SET_EX_INFORMATION is { PVOID VirtualAddress;
+    // ULONG_PTR VirtualAttributes; } -- 16 bytes on x64, and bit 0 of the
+    // attributes is Valid, meaning the page is in the target's working set.
+    // One call answers for as many pages as the buffer holds.
+    public bool TryResidency(ulong addr, int pages, bool[] resident)
+    {
+        if (pages <= 0 || pages > resident.Length) return false;
+        int bytes = pages * 16;
+        IntPtr info = Marshal.AllocHGlobal(bytes);
+        try
+        {
+            for (int i = 0; i < pages; i++)
+                Marshal.WriteInt64(info, i * 16, unchecked((long)(addr + (ulong)i * 0x1000)));
+            if (!Native.QueryWorkingSetEx(handle, info, bytes)) return false;
+            for (int i = 0; i < pages; i++)
+                resident[i] = (Marshal.ReadInt64(info, i * 16 + 8) & 1) != 0;
+            return true;
+        }
+        catch { return false; }
+        finally { Marshal.FreeHGlobal(info); }
     }
 
     public bool TryNextReadable(ulong addr, out ulong next)

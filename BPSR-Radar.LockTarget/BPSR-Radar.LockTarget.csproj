@@ -8,6 +8,12 @@
     <AssemblyName>BPSR-Radar.LockTarget</AssemblyName>
     <InvariantGlobalization>true</InvariantGlobalization>
 
+    <!-- Carried so the helper and the app report the same build. It used to
+         have no version at all, so its exe said 1.0.0 while the app said
+         0.1.5: two numbers for one release. See the app's csproj for why the
+         number is not written here. -->
+    <Version Condition="'$(Version)' == ''">0.1.6.0</Version>
+
     <!-- Same reason as the app: the release should be a short list. -->
     <PublishSingleFile>true</PublishSingleFile>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>

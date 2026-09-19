@@ -51,6 +51,9 @@ BLUE PROTOCOL: Star Resonance 用のスタンドアロン ミニマップ / ロ�
   - `%TEMP%\BPSR-Radar\` — 実行時の状態ファイル（再作成されます）
 - レジストリには何も書き込みません。ゲームのメモリは読み取りのみで、
   書き込み・インジェクション・フックは行いません。
+- ロックオンの対象を探すときだけ、タスクマネージャー上のゲームのメモリ使用量が
+  数百MB増えて見えることがあります。読み取ったページが OS によってゲーム側に
+  常駐扱いされるためで、ゲームが余分に確保しているわけではありません。
 
 ## English
 
@@ -99,6 +102,9 @@ app itself.
   - `%TEMP%\BPSR-Radar\` - runtime state, recreated as needed
 - Nothing is written to the registry. The game's memory is only ever read:
   no writes, no injection, no hooks.
+- While the tool is looking for the lock-on target, Task Manager may show the
+  game using a few hundred MB more. Reading a page makes Windows count it as
+  resident in the game; the game has not allocated anything extra.
 
 ## License
 

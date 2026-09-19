@@ -67,6 +67,12 @@ static class Native
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr baseAddr, byte[] buffer, nint size, out nint read);
 
+    // Asks which pages the target already has resident. Needs no access right
+    // beyond the PROCESS_QUERY_INFORMATION the handle is already opened with,
+    // and changes nothing in the target -- it is a question, not a request.
+    [DllImport("psapi.dll", SetLastError = true)]
+    public static extern bool QueryWorkingSetEx(IntPtr hProcess, IntPtr info, int cb);
+
     [StructLayout(LayoutKind.Sequential)]
     public struct MEMORY_BASIC_INFORMATION64
     {
@@ -235,6 +241,71 @@ static class Program
     // time, which is the one question it needs a human for. It does not: the
     // answer was already in the process, unrecorded.
     static int lockPressCount;
+
+    // Narrow first. Every record the eight-snapshot corpus has ever held was
+    // in a 16 MiB heap segment, and reading only those costs the game a
+    // fifteenth of the resident memory (see Scanner.HeapSegmentSize). It is a
+    // guess about one allocator, though, so an empty narrow result widens to
+    // what the scan always did rather than reporting "nothing is locked" --
+    // the worst case is the old cost, never a missed record.
+    //
+    // This lives in one function, and the test drives this function, so that
+    // deleting the fallback fails a test instead of only failing in the field.
+    internal static List<ulong> FindWithFallback(IMemSource mem, KnownEntities known,
+        out string diag, IDictionary<ulong, ulong>? owners = null,
+        bool mayReadColdPages = true)
+    {
+        var found = LockRecord.Find(mem, known, out diag, owners: owners,
+                                    pass: ScanPass.Narrow);
+        if (found.Count > 0) return found;
+
+        // The heap-segment guess broke in the field (2026-09-19 23:26:45: the
+        // narrow pass found nothing and a full pass found the record), so the
+        // next rung drops it. It still reads only resident pages, so it costs
+        // time and not a megabyte of the player's memory.
+        var resident = LockRecord.Find(mem, known, out string resDiag, owners: owners,
+                                       pass: ScanPass.Resident);
+        diag = $"{diag} | {resDiag}";
+        if (resident.Count > 0) return resident;
+
+        if (!mayReadColdPages) return resident;
+
+        var all = LockRecord.Find(mem, known, out string allDiag, owners: owners,
+                                  pass: ScanPass.Everything);
+        diag = $"{diag} | {allDiag}";
+        return all;
+    }
+
+    // Whether this scan is allowed the pass that reads pages the game does not
+    // have resident -- the only pass that can grow the game's memory.
+    //
+    // It used to run whenever the cheap pass came up empty, which sounded
+    // careful and was the opposite. Measured over one session: 22 of 26 scans
+    // widened, and in 21 of those 22 the expensive pass ALSO found nothing.
+    // Of course it did -- nothing was locked. Reading twelve gigabytes to
+    // confirm that a player who is not locking anything has no lock record
+    // took the game from 5,587 MiB to 12,752 MiB.
+    //
+    // "The cheap pass found nothing" and "there is nothing to find" are the
+    // same observation, so the trigger cannot be that. It has to be evidence
+    // that a record OUGHT to exist, and the only such evidence the helper has
+    // is the player pressing the lock key and getting nothing for it. The
+    // cooldown is there because that evidence can repeat faster than the scan.
+    internal const int ColdPassCooldownMs = 60_000;
+
+    internal static bool MayReadColdPages(bool unansweredPress, long msSinceColdPass) =>
+        unansweredPress && msSinceColdPass >= ColdPassCooldownMs;
+
+    // The game's resident memory, which this tool changes: reading a page
+    // through ReadProcessMemory faults it into the TARGET's working set and it
+    // does not come back on its own. Logged either side of a scan so the cost
+    // shows up in the log instead of only in the player's Task Manager.
+    // Returns 0 rather than throwing -- it is diagnostics, not a dependency.
+    static long TargetWorkingSetMiB(int pid)
+    {
+        try { return System.Diagnostics.Process.GetProcessById(pid).WorkingSet64 >> 20; }
+        catch { return 0; }
+    }
 
     // Whether the overlay was showing nothing when the last press landed, and
     // the value it was showing. See UnansweredPressesToDistrust.
@@ -515,6 +586,10 @@ static class Program
         {
             return SurveyRecords(args[1]);
         }
+        if (args.Length >= 2 && args[0] == "--scan-cost")
+        {
+            return ScanCost(args[1]);
+        }
         if (args.Length >= 2 && args[0] == "--replay")
         {
             return Replay(args[1]);
@@ -615,8 +690,23 @@ static class Program
         }
     }
 
+    // What build this is, for the log. The release number is chosen at
+    // release time, so during development every build says 0.0.0-dev and the
+    // commit hash is the only thing that tells two of them apart -- which is
+    // exactly what a bug report needs. A log that cannot name its build
+    // cannot be compared with another one.
+    internal static string BuildId()
+    {
+        var asm = System.Reflection.Assembly.GetEntryAssembly();
+        var info = asm is null ? null
+            : System.Reflection.CustomAttributeExtensions
+                .GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>(asm);
+        return info?.InformationalVersion ?? asm?.GetName().Version?.ToString() ?? "unknown";
+    }
+
     static int Run(int pid)
     {
+        LogEvent($"helper build {BuildId()}");
         IntPtr h = Native.OpenProcess(Native.PROCESS_QUERY_INFORMATION | Native.PROCESS_VM_READ, false, pid);
         if (h == IntPtr.Zero)
         {
@@ -644,6 +734,10 @@ static class Program
             bool sawFirstLock = false;
             var lastScan = Stopwatch.StartNew();
             bool scannedOnce = false;
+            // The last time a pass was allowed to read pages the game did not
+            // have resident. See MayReadColdPages.
+            var sinceColdPass = Stopwatch.StartNew();
+            bool coldPassRan = false;
             int lockableAtLastScan = int.MaxValue;
             int backoff = RescanMs;
             // What the last scan cost, which sets the floor before the next
@@ -868,8 +962,25 @@ static class Program
                     // whole set. Clearing them threw that evidence away on
                     // every scan. The scene-change branch still clears them,
                     // which is the case they genuinely go stale in.
-                    var found = LockRecord.Find(mem, Known, out string diag, owners: owners);
+                    long wsBefore = TargetWorkingSetMiB(pid);
+                    // `pressed` is the player asking for a lock and not having
+                    // got one; that, and only that, buys the expensive pass.
+                    bool mayReadCold = MayReadColdPages(
+                        pressed || unansweredPresses > 0,
+                        coldPassRan ? sinceColdPass.ElapsedMilliseconds : long.MaxValue);
+                    var found = FindWithFallback(mem, Known, out string diag, owners, mayReadCold);
+                    if (mayReadCold && diag.Contains("everything"))
+                    {
+                        sinceColdPass.Restart();
+                        coldPassRan = true;
+                    }
                     sw.Stop();
+                    long wsAfter = TargetWorkingSetMiB(pid);
+                    // What the scan cost the game, in the units the player
+                    // sees in Task Manager. Read pages are faulted into the
+                    // target's working set and do not leave on their own.
+                    if (wsBefore > 0 || wsAfter > 0)
+                        diag += $" ws={wsBefore}->{wsAfter}MiB";
                     lastScanMs = sw.ElapsedMilliseconds;
                     lastScan.Restart();
                     scannedOnce = true;
@@ -1463,6 +1574,63 @@ static class Program
     // walks the recorded snapshots with the position test removed and prints
     // every field it would otherwise have judged, so the predicate can be
     // rewritten against measured data instead of a guess.
+    // What the narrow pass costs and what it misses, over the whole corpus.
+    // The question it answers is not "is it faster" but "does reading a
+    // fifteenth of the memory still find every record" -- a miss here is a
+    // target the overlay would show as `-`, so the pass/fail is the record
+    // sets being equal, and the megabytes are the reason to care.
+    static int ScanCost(string dir)
+    {
+        if (!Directory.Exists(dir))
+        {
+            Console.Error.WriteLine($"no such directory: {dir}");
+            return 2;
+        }
+        var snaps = Directory.GetFiles(dir, "snap-*.bin", SearchOption.AllDirectories)
+                             .OrderBy(x => x).ToArray();
+        if (snaps.Length == 0)
+        {
+            Console.Error.WriteLine($"no snapshots under {dir}");
+            return 2;
+        }
+
+        Console.WriteLine($"{"snapshot",-30} {"narrow",-26} {"everything",-26} same?");
+        ulong narrowBytes = 0, wideBytes = 0;
+        int checked_ = 0, agreed = 0;
+        foreach (var path in snaps)
+        {
+            string stem = path[..^4];
+            var known = new KnownEntities(stem + ".entities.json");
+            known.Load(forceFresh: true);
+            if (known.Count == 0) continue;
+
+            using var mem = new SnapshotMem(path);
+            var regions = mem.Regions(privateOnly: true);
+            foreach (var r in regions)
+            {
+                wideBytes += r.Size;
+                if (Scanner.HeapSegment(r.Size)) narrowBytes += r.Size;
+            }
+
+            var n = LockRecord.Find(mem, known, out string nDiag, pass: ScanPass.Narrow);
+            var w = LockRecord.Find(mem, known, out string wDiag, pass: ScanPass.Everything);
+            n.Sort(); w.Sort();
+            bool same = n.Count == w.Count;
+            for (int i = 0; same && i < n.Count; i++) same = n[i] == w[i];
+            checked_++;
+            if (same) agreed++;
+            Console.WriteLine($"{Path.GetFileNameWithoutExtension(path),-30} {nDiag,-26} {wDiag,-26} " +
+                              (same ? "yes" : $"NO  narrow missed {string.Join(",", w.Except(n).Select(x => $"0x{x:x}"))}"));
+        }
+
+        Console.WriteLine();
+        Console.WriteLine($"snapshots where the two passes agree: {agreed}/{checked_}");
+        Console.WriteLine($"bytes read: narrow {narrowBytes / (1024.0 * 1024 * 1024):F2} GiB, " +
+                          $"everything {wideBytes / (1024.0 * 1024 * 1024):F2} GiB " +
+                          $"({(wideBytes == 0 ? 0 : 100.0 * (1 - (double)narrowBytes / wideBytes)):F1}% less)");
+        return agreed == checked_ && checked_ > 0 ? 0 : 1;
+    }
+
     static int SurveyRecords(string dir)
     {
         if (!Directory.Exists(dir))

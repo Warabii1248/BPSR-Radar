@@ -515,6 +515,30 @@ static class Scanner
     // answer.
     public static bool ZeroOrFlagPair(ulong v) => (uint)v <= 1 && (uint)(v >> 32) <= 1;
 
+    // Every lock record ever found sits in a private region of exactly this
+    // size. Measured 2026-09-19 across the eight-snapshot corpus by taking the
+    // twenty records --survey-records reports and looking up the region each
+    // one lands in:
+    //
+    //   region sizes holding a record: min 16.00 MiB  max 16.00 MiB  (n=20)
+    //   distinct sizes: [16.0]
+    //
+    // It is the game allocator's segment granularity. Reading only regions of
+    // that size costs 0.39 GiB per scan instead of 5.69 -- 93.2% less over the
+    // same corpus -- and the saving is not about time. Every page read through
+    // ReadProcessMemory is faulted into the TARGET's working set and stays
+    // there: a process holding 4,173 MB committed and 94 MB resident went to
+    // 4,202 MB when 4.05 GiB of it was read, and was still at 4,213 MB twenty
+    // seconds later with 27 GB free. That is why a player sees the game using
+    // more than 10 GB while this tool is running.
+    //
+    // This is a guess about one allocator, not a property of the record, so
+    // the narrow pass is never the only pass: Find falls back to every region
+    // when it comes up empty, and the worst case is what the scan cost before.
+    public const ulong HeapSegmentSize = 16UL << 20;
+
+    public static bool HeapSegment(ulong regionSize) => regionSize == HeapSegmentSize;
+
     public static bool PositionField(ulong v) => Doubleish(v) || FloatPairish(v);
 
     public static bool FloatPairish(ulong v) =>

@@ -9,8 +9,24 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <CetCompat>false</CetCompat>
-    <Version>0.1.5</Version>
-    <InformationalVersion>0.1.5</InformationalVersion>
+    <!-- The release number is chosen when there is a release, not while
+         developing. A build that is not being distributed has no business
+         claiming a released version's number, and two builds sharing one
+         number is how a player's log stops identifying anything.
+
+         Development runs on 0.1.6.x: 0.1.5 is the last release, 0.1.6 is the
+         line being worked on, and the fourth part is the commit count, so
+         every dev build has its own number without anyone choosing one.
+         tools/publish.ps1 fills it in; this value is only the fallback for a
+         plain `dotnet build`.
+
+         The release gets its number at release time:
+         tools/publish.ps1 -Version 0.1.7.
+
+         Either way the commit hash the SDK appends to InformationalVersion is
+         the exact identity, and both binaries write it to the log on startup,
+         so a bug report names its build whichever kind it came from. -->
+    <Version Condition="'$(Version)' == ''">0.1.6.0</Version>
 
     <!-- One executable instead of 265 loose files beside it. A player
          unpacking the release should see what to run without hunting. -->

@@ -30,6 +30,37 @@ using System.Buffers.Binary;
 // Measured selectivity: across eight sweeps of a live session, exactly one
 // address matched this signature while a lock was held, and none matched
 // while nothing was locked.
+// How much of the target a scan reads, on the two axes that matter.
+//
+// `HeapSegmentsOnly` is about which regions: a guess about the game's
+// allocator that is right most of the time and measurably wrong some of it
+// (see Scanner.HeapSegmentSize).
+//
+// `ResidentPagesOnly` is about which pages, and it is not a guess about the
+// record at all -- it is the difference between a scan the player pays for
+// and one they do not. Reading a page that is not in the game's working set
+// puts it there and it stays: one measured scan took the game from 5,587 MiB
+// to 12,752 MiB. Reading a page that is already resident costs nothing.
+//
+// So the passes go cheap, then free-but-slow, then the one that makes no
+// assumptions and is therefore the only one that can cost the player memory.
+readonly record struct ScanPass(bool HeapSegmentsOnly, bool ResidentPagesOnly)
+{
+    // Heap segments, resident pages. ~0.4 GiB, ~100 ms, cannot inflate.
+    public static readonly ScanPass Narrow = new(true, true);
+
+    // Every region, resident pages. Costs time, still cannot inflate: this is
+    // the answer to "the narrow pass guessed wrong about the allocator".
+    public static readonly ScanPass Resident = new(false, true);
+
+    // Every region, every page. Assumes nothing, finds anything, and is the
+    // only pass that grows the game's resident set -- so it is rationed.
+    public static readonly ScanPass Everything = new(false, false);
+
+    public string Name =>
+        HeapSegmentsOnly ? "narrow" : ResidentPagesOnly ? "resident" : "everything";
+}
+
 static class LockRecord
 {
     // The window read from memory runs from the owner pointer to the kind.
@@ -158,11 +189,26 @@ static class LockRecord
         return true;
     }
 
+    // One per worker thread, not one per region: a game process has thousands
+    // of private regions and allocating these for each of them churns
+    // gigabytes of large-object heap per scan.
+    private sealed class Worker
+    {
+        public readonly byte[] Buf = new byte[Scanner.ChunkSize];
+        // One extra: a chunk that starts part way into a page spans one more
+        // page than its length divided by the page size.
+        public readonly bool[] Resident = new bool[Scanner.ChunkSize / (int)PageSize + 1];
+    }
+
     // Scans for the record. Candidates are addresses holding a uuid the packet
     // stream names: the structural test alone is strong, but the entity list
     // makes it decisive and keeps the candidate set to a few hundred.
     public static List<ulong> Find(IMemSource mem, KnownEntities known, out string diag,
-        bool requireKnown = true, IDictionary<ulong, ulong>? owners = null)
+        bool requireKnown = true, IDictionary<ulong, ulong>? owners = null,
+        // `default` is (false, false) == Everything, which is what every
+        // caller that does not care about cost wants: the analysis modes and
+        // the tests read the whole snapshot. Verified in SelfTestHold.
+        ScanPass pass = default)
     {
         var found = new List<(ulong Addr, ulong Owner)>();
         var gate = new object();
@@ -171,6 +217,16 @@ static class LockRecord
         ulong skippedBytes = 0;
 
         var regions = mem.Regions(privateOnly: true);
+        if (pass.HeapSegmentsOnly)
+            regions = regions.FindAll(r => Scanner.HeapSegment(r.Size));
+        ulong regionBytes = 0;
+        foreach (var r in regions) regionBytes += r.Size;
+        // Which region sizes actually held a record. The 16 MiB rule came
+        // from eight snapshots and a live session then broke it, so the sizes
+        // that work are worth measuring every time rather than assuming.
+        var hitSizes = new SortedSet<ulong>();
+        ulong readBytes = 0;
+        ulong coldSkipped = 0;
         // Leave the game half the machine. Reading gigabytes through
         // ReadProcessMemory on every core starves it and shows up as stutter.
         int workers = Math.Max(2, Environment.ProcessorCount / 2);
@@ -179,18 +235,58 @@ static class LockRecord
             // One 4 MiB buffer per worker, not per region. A game process has
             // thousands of private regions, and allocating a large-object-heap
             // array for each of them churns gigabytes per scan.
-            () => new byte[Scanner.ChunkSize],
-            (region, _, buf) =>
+            () => new Worker(),
+            (region, _, w) =>
         {
+            var buf = w.Buf;
             var (b, s) = region;
             var local = new List<(ulong, ulong)>();
             int localCand = 0;
             int localBad = 0;
             ulong localSkipped = 0;
+            ulong localRead = 0;
+            ulong localCold = 0;
             ulong pos = 0;
             while (pos < s)
             {
                 int want = (int)Math.Min((ulong)Scanner.ChunkSize, s - pos);
+                // Skip pages the target does not have resident. Reading one
+                // would fault it in and leave it there, which is the whole
+                // cost this pass exists to avoid; a source that cannot answer
+                // (a snapshot, the test double) reads everything as before.
+                if (pass.ResidentPagesOnly)
+                {
+                    // `pos` is not page-aligned after the overlap step, so ask
+                    // about the page that contains it. Getting this wrong is
+                    // silent: the query fails, the pass reads everything, and
+                    // it looks like residency filtering that does nothing.
+                    ulong here = b + pos;
+                    ulong pageBase = here & ~(PageSize - 1);
+                    int lead = (int)(here - pageBase);
+                    int pages = (lead + want + (int)PageSize - 1) / (int)PageSize;
+                    if (mem.TryResidency(pageBase, pages, w.Resident))
+                    {
+                        int first = 0;
+                        while (first < pages && !w.Resident[first]) first++;
+                        if (first >= pages)
+                        {
+                            // Nothing here is resident: skip the whole chunk.
+                            localCold += (ulong)want;
+                            pos += (ulong)want;
+                            continue;
+                        }
+                        if (first > 0)
+                        {
+                            ulong to = pageBase + (ulong)first * PageSize;
+                            localCold += to - here;
+                            pos += to - here;
+                            continue;
+                        }
+                        int run = 0;
+                        while (run < pages && w.Resident[run]) run++;
+                        want = Math.Min(want, run * (int)PageSize - lead);
+                    }
+                }
                 if (!mem.Read(b + pos, buf, want, out int read) || read <= 0)
                 {
                     // Nothing at all could be read here, so the page at `pos`
@@ -228,6 +324,7 @@ static class LockRecord
                     var view = Parse(buf.AsSpan(off - Before, ReadSize));
                     if (view.Valid) local.Add((b + pos + (ulong)off, view.Owner));
                 }
+                localRead += (ulong)read;
                 if ((ulong)read >= s - pos) break;
                 // Overlap so a record straddling a chunk boundary is still
                 // seen, and stay 8-aligned: a short read would otherwise shift
@@ -235,11 +332,17 @@ static class LockRecord
                 ulong step = (ulong)Math.Max(8, read - ReadSize) & ~7UL;
                 pos += Math.Max(8, step);
             }
-            if (local.Count > 0 || localCand > 0 || localBad > 0)
+            lock (gate)
             {
-                lock (gate) { found.AddRange(local); candidates += localCand; unreadable += localBad; skippedBytes += localSkipped; }
+                found.AddRange(local);
+                candidates += localCand;
+                unreadable += localBad;
+                skippedBytes += localSkipped;
+                readBytes += localRead;
+                coldSkipped += localCold;
+                if (local.Count > 0) hitSizes.Add(s);
             }
-            return buf;
+            return w;
         },
             _ => { });
 
@@ -252,7 +355,15 @@ static class LockRecord
             foreach (var (a, o) in found) owners[a] = o;
         }
 
-        diag = $"cand={candidates} rec={found.Count}"
+        // The read volume is a cost the player pays in resident memory, not
+        // just a number of milliseconds, so it is in every line: how much was
+        // offered (reg), how much was actually read, and how much was left
+        // cold. `in=` names the region sizes that held a record, which is the
+        // only way to find out when the heap-segment guess stops being true.
+        diag = $"{pass.Name} cand={candidates} rec={found.Count}"
+             + $" reg={regions.Count}/{regionBytes >> 20}MiB read={readBytes >> 20}MiB"
+             + (coldSkipped >= (1 << 20) ? $" cold={coldSkipped >> 20}MiB" : "")
+             + (hitSizes.Count > 0 ? $" in={string.Join("/", hitSizes.Select(x => (x >> 20) + "MiB"))}" : "")
              + (unreadable > 0 ? $" gaps={unreadable} skipped={skippedBytes / PageSize}pg" : "");
         return found.Select(x => x.Addr).ToList();
     }

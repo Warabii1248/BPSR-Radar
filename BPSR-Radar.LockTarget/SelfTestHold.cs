@@ -63,6 +63,7 @@ static class SelfTestHold
         failures += LockKeyEdge();
         failures += ScanDutyCycle();
         failures += DeadRegionStride();
+        failures += NarrowScanPass();
         failures += SceneInvalidation();
         failures += ProvisionalRecordSet();
         failures += DiagnosticsCanFire();
@@ -329,6 +330,143 @@ static class SelfTestHold
         }
 
         return f;
+    }
+
+    // The narrow pass reads a fifteenth of the game's memory, which is the
+    // difference between the game sitting at 5 GB and at 10 GB while this tool
+    // runs. It is allowed to be a guess -- it is not allowed to lose a record
+    // quietly, so the fallback is what these tests are really about.
+    private static int NarrowScanPass()
+    {
+        int f = 0;
+        const ulong Base = 0x0001_0000;
+
+        // Every caller that does not pass a pass gets Everything, which is
+        // what the analysis modes and the older tests rely on. It is a
+        // `default` in the signature because a record struct cannot be a
+        // compile-time constant any other way, so it is worth asserting that
+        // the default really is the permissive one.
+        f += Check("the default pass is Everything",
+            default(ScanPass) == ScanPass.Everything);
+        f += Check("  and the three passes are distinct",
+            ScanPass.Narrow != ScanPass.Resident && ScanPass.Resident != ScanPass.Everything);
+
+        f += Check("a 16 MiB region is a heap segment",
+            Scanner.HeapSegment(16UL << 20));
+        f += Check("  and 8 MiB and 32 MiB are not",
+            !Scanner.HeapSegment(8UL << 20) && !Scanner.HeapSegment(32UL << 20));
+
+        // ---- the ration on the pass that costs the player memory ----------
+        //
+        // This is the one that mattered in the field. The old rule was "widen
+        // when the cheap pass finds nothing", and 21 of 22 widenings in a real
+        // session found nothing either, because nothing was locked. Reading
+        // twelve gigabytes to confirm that cost the game 7 GiB of resident
+        // memory it did not get back.
+        f += Check("no press, no cold pass -- however long it has been",
+            !Program.MayReadColdPages(false, long.MaxValue));
+        f += Check("a press alone does not buy one inside the cooldown",
+            !Program.MayReadColdPages(true, Program.ColdPassCooldownMs - 1));
+        f += Check("a press plus the cooldown does",
+            Program.MayReadColdPages(true, Program.ColdPassCooldownMs));
+
+        // ---- the narrow pass, when the guess holds ------------------------
+        {
+            var mem = new FakeMem(Base, (int)Scanner.HeapSegmentSize);
+            ulong recordAt = Base + 0x8040;
+            PlaceRecord(mem, recordAt);
+            var known = new KnownEntities("");
+            known.Seed(new[] { MonsterA });
+
+            f += Check("a record in a 16 MiB region is found by the narrow pass alone",
+                LockRecord.Find(mem, known, out _, pass: ScanPass.Narrow).Contains(recordAt));
+            LockRecord.Find(mem, known, out string d, pass: ScanPass.Narrow);
+            f += Check($"  and the scan reports what it read ({d})",
+                d.Contains("reg=1/16MiB") && d.Contains("read=") && d.Contains("in=16MiB"));
+
+            mem.ReadAttempts = 0;
+            var hit = Program.FindWithFallback(mem, known, out string d2);
+            f += Check($"  and a narrow hit runs no further pass ({d2})",
+                hit.Contains(recordAt) && !d2.Contains("|"));
+        }
+
+        // ---- the guess breaking, which it did in the field ----------------
+        //
+        // 2026-09-19 23:26:45: narrow[rec=0] and a full pass found the record.
+        // The rung that catches this reads every region but only pages the
+        // game already has resident, so it cannot inflate anything.
+        {
+            var mem = new FakeMem(Base, (int)Scanner.HeapSegmentSize + 0x10000);
+            ulong recordAt = Base + 0x8040;
+            PlaceRecord(mem, recordAt);
+            var known = new KnownEntities("");
+            known.Seed(new[] { MonsterA });
+
+            f += Check("a record outside a heap segment is invisible to the narrow pass",
+                !LockRecord.Find(mem, known, out _, pass: ScanPass.Narrow).Contains(recordAt));
+            f += Check("  and the resident pass finds it without the cold pass",
+                Program.FindWithFallback(mem, known, out _, null, mayReadColdPages: false)
+                       .Contains(recordAt));
+        }
+
+        // ---- residency: what the cold pass is actually for ----------------
+        //
+        // A record on a page the game does not have resident. Reading it is
+        // what grows the game's memory, so it is exactly what the ration
+        // withholds -- and exactly what it must still allow through when the
+        // player has pressed the key and got nothing.
+        {
+            ulong recordAt = Base + 0x8040;
+            var known = new KnownEntities("");
+            known.Seed(new[] { MonsterA });
+
+            var cold = new FakeMem(Base, (int)Scanner.HeapSegmentSize);
+            PlaceRecord(cold, recordAt);
+            cold.ResidentMap = new bool[(int)Scanner.HeapSegmentSize / 0x1000];
+            for (int i = 0; i < cold.ResidentMap.Length; i++) cold.ResidentMap[i] = true;
+            // The record's page and the 2 MiB after it are out. More than one
+            // page so `cold=` reports a number a reader can act on, and so
+            // the test is not satisfied by an off-by-one that happens to
+            // exclude exactly the right page.
+            for (int i = 0; i < 512; i++) cold.ResidentMap[0x8040 / 0x1000 + i] = false;
+
+            f += Check("a record on a non-resident page is not found by a resident-only pass",
+                !LockRecord.Find(cold, known, out _, pass: ScanPass.Resident).Contains(recordAt));
+            f += Check("  and not by the ladder while the cold pass is rationed",
+                !Program.FindWithFallback(cold, known, out _, null, mayReadColdPages: false)
+                        .Contains(recordAt));
+            f += Check("  but the cold pass finds it when it is allowed",
+                Program.FindWithFallback(cold, known, out string d, null, mayReadColdPages: true)
+                       .Contains(recordAt));
+
+            LockRecord.Find(cold, known, out string rd, pass: ScanPass.Resident);
+            f += Check($"  and a resident-only pass says how much it left cold ({rd})",
+                rd.Contains("cold=2MiB"));
+
+            // Control: the same memory with everything resident is found by
+            // the cheap pass, so the miss above is the residency filter and
+            // not something else about the fixture.
+            var warm = new FakeMem(Base, (int)Scanner.HeapSegmentSize);
+            PlaceRecord(warm, recordAt);
+            warm.ResidentMap = new bool[(int)Scanner.HeapSegmentSize / 0x1000];
+            for (int i = 0; i < warm.ResidentMap.Length; i++) warm.ResidentMap[i] = true;
+            f += Check("control: all pages resident, the narrow pass finds it",
+                LockRecord.Find(warm, known, out _, pass: ScanPass.Narrow).Contains(recordAt));
+        }
+
+        return f;
+    }
+
+    // A manual-lock record at `addr`, in the shape Parse accepts.
+    private static void PlaceRecord(FakeMem mem, ulong addr)
+    {
+        var w = mem.Span(addr - LockRecord.Before);
+        w[..LockRecord.ReadSize].Clear();
+        Own(w);
+        BinaryPrimitives.WriteUInt64LittleEndian(w[0x08..], MonsterA);
+        BinaryPrimitives.WriteDoubleLittleEndian(w[0x20..], -142.5);
+        BinaryPrimitives.WriteDoubleLittleEndian(w[0x28..], 311.75);
+        BinaryPrimitives.WriteUInt64LittleEndian(w[0x38..], 1UL);
     }
 
     // A record adopted in one scene is gone after a zone change, and nothing
@@ -1259,6 +1397,22 @@ static class SelfTestHold
 
         public List<(ulong Base, ulong Size)> Regions(bool privateOnly) =>
             new() { (baseAddr, (ulong)bytes.Length) };
+
+        // Per-page residency, as QueryWorkingSetEx would report it. Null
+        // means the source cannot answer, which is what a snapshot does and
+        // what makes a resident-only pass read everything.
+        public bool[]? ResidentMap;
+
+        public bool TryResidency(ulong addr, int pages, bool[] resident)
+        {
+            if (ResidentMap == null || addr < baseAddr) return false;
+            ulong off = addr - baseAddr;
+            if (off % 0x1000 != 0) return false;
+            int first = (int)(off / 0x1000);
+            if (first + pages > ResidentMap.Length) return false;
+            for (int i = 0; i < pages; i++) resident[i] = ResidentMap[first + i];
+            return true;
+        }
 
         // Models a region that was freed or re-protected under the scan.
         // ReadProcessMemory fails for a range that touches it at all, which
