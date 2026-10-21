@@ -53,14 +53,11 @@ internal static class LockTargetService
         }
     }
 
-    // Packet-derived lock target (WorldActivityNtf ClientTargetChange 0x300B,
-    // field 4 TargetUuid). Timestamp precedence vs the memory helper: whichever
-    // signal changed most recently wins, so a packet lock displays instantly
-    // and the helper covers cases where the packet does not fire.
-    private static long packetUuid;
-    private static long packetAtMs;
+    // Last UUID published by the memory helper. Packet-side target-change
+    // notifications are useful diagnostics, but they also fire for the game's
+    // automatic/attack target and therefore are not evidence of a manual lock.
+    // Only the helper's measured manual flag is allowed to drive the display.
     private static long observedHelperUuid;
-    private static long helperUuidAtMs;
 
     // Raised when the published target changes. The overlay redraws on this
     // instead of waiting for the next UI timer tick, which was the last of
@@ -79,37 +76,19 @@ internal static class LockTargetService
         CurrentTargetTypeUid = typeUid;
         CurrentTargetUuid = uuid;
         if (!changed) return;
-        // The end of the chain. Everything else in this log is something the
-        // helper decided; this is what the overlay was actually given, after
-        // the packet-versus-helper precedence rule has run. They are expected
-        // to agree and there was no record of whether they did.
+        // The end of the chain. This is what the overlay was actually given
+        // after reading the helper's manual-lock result.
         LogEvent($"app show 0x{was:x} -> 0x{uuid:x}");
         try { TargetChanged?.Invoke(); } catch { }
     }
 
     public static void OnPacketTargetUuid(long uuid)
     {
-        packetUuid = uuid;
-        packetAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-
-        // The packet is the earliest signal there is -- it arrives before the
-        // helper's next memory poll, let alone before this service next reads
-        // the helper's file. Parking it in a field and letting the tick
-        // collect it threw that entire lead away. Publishing here agrees with
-        // the tick's own precedence rule (whichever signal moved most recently
-        // wins) because nothing can have moved more recently than this.
-        //
-        // The helper's memory-side extras describe the target it last
-        // reported, so they are dropped unless they happen to describe this
-        // one.
-        if (watchedPid != 0 && RadarSettings.Instance.LockTargetEnabled)
-        {
-            bool sameAsHelper = uuid == observedHelperUuid;
-            SetTarget(uuid, sameAsHelper ? CurrentTargetAttrs : null,
-                sameAsHelper ? CurrentTargetTypeUid : 0);
-        }
-
-        LogEvent($"pkt uuid=0x{uuid:x}");
+        // Keep this signal for correlation only. Live logs proved it can move
+        // while the helper reports no manual lock, and because it may not emit
+        // a clear on a scene transition, letting it own CurrentTargetUuid can
+        // leave an enemy name displayed indefinitely in the next scene.
+        LogEvent($"pkt target-hint uuid=0x{uuid:x} ignored");
     }
 
     // The capture thread used to append to the log file inline, one
@@ -226,11 +205,13 @@ internal static class LockTargetService
         transientUntil = DateTime.UtcNow.AddSeconds(seconds);
     }
 
-    // True while the locked target is an elite or a boss. The overlay draws
-    // those in bold: they are what the player is picking out of a pull.
-    public static bool TargetIsStrong =>
-        CurrentTargetUuid != 0
-        && RadarCanvas.IsStrong(RadarTracker.ClassOf(CurrentTargetUuid, CurrentTargetTypeUid));
+    // Class of the locked target, null without one. The overlay draws elites
+    // and bosses in bold and their own colours: they are what the player is
+    // picking out of a pull. Null while a Flash message replaces the name,
+    // so the message is not drawn as the target.
+    public static RadarEntityKind? TargetKind =>
+        CurrentTargetUuid != 0 && DateTime.UtcNow >= transientUntil
+            ? RadarTracker.ClassOf(CurrentTargetUuid, CurrentTargetTypeUid) : null;
 
     public static string StatusText
     {
@@ -334,10 +315,7 @@ internal static class LockTargetService
             elevationDenied = false;
             lastLaunch = DateTime.MinValue;
             SetTarget(0, null, 0);
-            packetUuid = 0;
-            packetAtMs = 0;
             observedHelperUuid = 0;
-            helperUuidAtMs = 0;
         }
 
         var state = ReadState();
@@ -386,20 +364,13 @@ internal static class LockTargetService
             if (state.Uuid != observedHelperUuid)
             {
                 observedHelperUuid = state.Uuid;
-                helperUuidAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
                 PacketDiag.WatchUuid(state.Uuid);
             }
-            // Whichever signal moved most recently wins. The packet branch
-            // has usually published its own uuid already; this re-states the
-            // same decision for the case where the helper is the newer one.
-            bool packetWins = packetAtMs >= helperUuidAtMs;
-            SetTarget(packetWins ? packetUuid : state.Uuid,
-                packetWins ? null : state.Attrs,
-                packetWins ? 0 : state.TypeUid);
+            SetTarget(state.Uuid, state.Attrs, state.TypeUid);
             return;
         }
 
-        SetTarget(packetUuid, null, 0);
+        SetTarget(0, null, 0);
 
         if (elevationDenied)
         {
@@ -557,21 +528,54 @@ internal static class LockTargetService
     // one, so a read can lose the race with that rename and come back empty.
     // At the old tick rate that was rare enough to ignore; at this one it
     // would be frequent, and falling through to "no state" for a single tick
-    // drops the target to the packet value, fires a change event and makes
-    // the status read as though the helper had died -- a visible flicker.
+    // drops the target to zero, fires a change event and makes the status read
+    // as though the helper had died -- a visible flicker.
     //
     // A failed read is not news. Keep the last good reading and let its own
     // timestamp decide when it has gone stale, which is what Fresh is for.
     private static HelperState? lastGoodState;
 
-    private static HelperState? ReadState()
+    // The helper writes only when the reading changes and on a 2s heartbeat,
+    // but this runs every 30ms. A file whose time and size match the last good
+    // parse is that parse: one stat instead of open, read and deserialize.
+    // Each publish is a fresh file renamed into place, so its time moves --
+    // but only by the file-time tick (up to ~16ms), and two same-length
+    // readings written within one tick would compare equal. So the shortcut
+    // waits until the parse came SettledMs after the file's time: a later
+    // write is then stamped past it.
+    private const int StateSettledMs = 100;
+    private static DateTime lastStateWriteUtc;
+    private static DateTime lastStateParseUtc;
+    private static long lastStateLength = -1;
+    internal static int StateParses;
+
+    private static HelperState? ReadState() => ReadState(StatePath);
+
+    private static HelperState? ReadState(string path)
     {
         HelperState? s = null;
         try
         {
-            if (File.Exists(StatePath))
+            var info = new FileInfo(path);
+            if (info.Exists)
             {
-                s = JsonSerializer.Deserialize<HelperState>(File.ReadAllText(StatePath));
+                if (lastGoodState != null && info.LastWriteTimeUtc == lastStateWriteUtc && info.Length == lastStateLength
+                    && (lastStateParseUtc - lastStateWriteUtc).TotalMilliseconds >= StateSettledMs)
+                {
+                    s = lastGoodState;
+                }
+                else
+                {
+                    StateParses++;
+                    var parsedAt = DateTime.UtcNow;
+                    s = JsonSerializer.Deserialize<HelperState>(File.ReadAllText(path));
+                    if (s != null)
+                    {
+                        lastStateWriteUtc = info.LastWriteTimeUtc;
+                        lastStateLength = info.Length;
+                        lastStateParseUtc = parsedAt;
+                    }
+                }
             }
         }
         catch { }

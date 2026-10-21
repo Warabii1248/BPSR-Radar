@@ -23,17 +23,29 @@
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="Button">
-                        <Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="6">
-                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
-                        </Border>
+                        <Grid>
+                            <Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="6">
+                                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                            </Border>
+                            <!-- Bottom line of a toggle that is ON (Tag="on"); it takes no space. -->
+                            <Border x:Name="onLine" Height="2" Margin="6,0" VerticalAlignment="Bottom"
+                                    CornerRadius="1" Background="#3FA7AD" Visibility="Collapsed"/>
+                        </Grid>
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsMouseOver" Value="True">
                                 <Setter Property="Background" Value="#2A3F44"/>
+                            </Trigger>
+                            <Trigger Property="Tag" Value="on">
+                                <Setter TargetName="onLine" Property="Visibility" Value="Visible"/>
                             </Trigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
                 </Setter.Value>
             </Setter>
+        </Style>
+        <!-- Title bar buttons drawn with an icon font (Windows 11, else Windows 10). -->
+        <Style x:Key="IconBtn" TargetType="Button" BasedOn="{StaticResource TitleBtn}">
+            <Setter Property="FontFamily" Value="Segoe Fluent Icons, Segoe MDL2 Assets"/>
         </Style>
     </Window.Resources>
     <Border x:Name="RootBorder" CornerRadius="12" BorderThickness="1"
@@ -61,11 +73,11 @@
                     </Grid.ColumnDefinitions>
                     <TextBlock Text="BPSR Radar" VerticalAlignment="Center" Foreground="#CFE8EA"
                                FontSize="12" FontWeight="SemiBold"/>
-                    <Button x:Name="PinButton" Grid.Column="1" Style="{StaticResource TitleBtn}" Content="📌"/>
-                    <Button x:Name="ThroughButton" Grid.Column="2" Style="{StaticResource TitleBtn}" Content="🖱"/>
-                    <Button x:Name="LockButton" Grid.Column="3" Style="{StaticResource TitleBtn}" Content="🎯"/>
-                    <Button x:Name="SettingsButton" Grid.Column="4" Style="{StaticResource TitleBtn}" Content="⚙"/>
-                    <Button x:Name="CloseButton" Grid.Column="5" Style="{StaticResource TitleBtn}" Content="✕"
+                    <Button x:Name="PinButton" Grid.Column="1" Style="{StaticResource IconBtn}" Content="&#xE718;"/>
+                    <Button x:Name="ThroughButton" Grid.Column="2" Style="{StaticResource IconBtn}" Content="&#xE962;"/>
+                    <Button x:Name="LockButton" Grid.Column="3" Style="{StaticResource IconBtn}" Content="&#xE81D;"/>
+                    <Button x:Name="SettingsButton" Grid.Column="4" Style="{StaticResource IconBtn}" Content="&#xE713;"/>
+                    <Button x:Name="CloseButton" Grid.Column="5" Style="{StaticResource IconBtn}" Content="&#xE8BB;"
                             Width="26" Height="24" FontSize="11"/>
                 </Grid>
 
@@ -81,7 +93,8 @@
                         <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
                     <TextBlock x:Name="StatusText" VerticalAlignment="Center" Foreground="#9FC4C8" FontSize="11"
-                               TextTrimming="CharacterEllipsis"/>
+                               TextTrimming="CharacterEllipsis"
+                               ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}"/>
                     <Button Grid.Column="1" Style="{StaticResource TitleBtn}" Content="−" Click="ZoomOut_Click"/>
                     <Button Grid.Column="2" Style="{StaticResource TitleBtn}" Content="＋" Click="ZoomIn_Click"/>
                     <Button x:Name="FitButton" Grid.Column="3" Style="{StaticResource TitleBtn}" Content="Fit"

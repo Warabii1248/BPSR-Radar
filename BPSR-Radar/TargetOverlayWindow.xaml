@@ -11,11 +11,34 @@
         Topmost="True">
     <Border x:Name="Frame" CornerRadius="7" MouseLeftButtonDown="Frame_MouseLeftButtonDown">
         <Grid>
-            <TextBlock x:Name="TargetText" Text="—"
-                       VerticalAlignment="Center"
-                       Margin="10,0,16,0"
-                       TextTrimming="CharacterEllipsis"
-                       TextAlignment="Center"/>
+            <Grid Margin="10,2,16,3">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="*"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <TextBlock x:Name="TargetText" Text="—"
+                           VerticalAlignment="Center"
+                           TextTrimming="CharacterEllipsis"
+                           TextAlignment="Center"/>
+                <!-- Hidden (not collapsed) while nothing is locked, so the name
+                     does not jump when a lock comes and goes. -->
+                <!-- The bar and the text share the one cell; the HP mode shows
+                     one of them, never both. -->
+                <Grid x:Name="HpRow" Grid.Row="1" Visibility="Hidden">
+                    <Grid x:Name="HpBar" VerticalAlignment="Center" Height="5">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition x:Name="HpFilledColumn" Width="0*"/>
+                            <ColumnDefinition x:Name="HpRemainingColumn" Width="1*"/>
+                        </Grid.ColumnDefinitions>
+                        <!-- Dimmed (in code) while the HP is not known, so that reads
+                             differently from a known HP of 0. -->
+                        <Border x:Name="HpTrack" Grid.ColumnSpan="2" Background="#404D52" CornerRadius="2"/>
+                        <Border x:Name="HpFill" Background="#D85B64" CornerRadius="2"/>
+                    </Grid>
+                    <TextBlock x:Name="HpText" Margin="0"
+                               HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                </Grid>
+            </Grid>
             <Thumb x:Name="ResizeThumb" Width="14" Height="14"
                    HorizontalAlignment="Right" VerticalAlignment="Bottom"
                    DragDelta="ResizeThumb_DragDelta" Cursor="SizeNWSE">

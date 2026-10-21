@@ -39,19 +39,29 @@ internal sealed class ClickThroughGuardWindow : Window
         {
             Width = 32,
             Height = 30,
-            Content = "🖱",
+            // The same glyph and ON colour as the title bar's click-through
+            // button it covers (this window only shows while that is ON).
+            Content = "",
+            FontFamily = new FontFamily("Segoe Fluent Icons, Segoe MDL2 Assets"),
             FontSize = 14,
             Background = new SolidColorBrush(Color.FromRgb(0x2A, 0x3F, 0x44)),
             BorderBrush = new SolidColorBrush(Color.FromRgb(0xE3, 0xD0, 0x7B)),
             BorderThickness = new Thickness(1.5),
-            Foreground = new SolidColorBrush(Color.FromRgb(0xBF, 0xE3, 0xE6)),
+            Foreground = new SolidColorBrush(Color.FromRgb(0x3F, 0xA7, 0xAD)),
             Template = template,
-            ToolTip = S.T("Click-through ON — click to restore mouse input",
-                "クリック透過中 — クリックでマウス操作を復帰"),
         };
         ToolTipService.SetInitialShowDelay(button, 0);
         button.Click += (_, _) => Clicked?.Invoke();
         Content = button;
+        ApplyStrings();
+    }
+
+    // The window is reused across toggles; refreshed on each show so a
+    // language change in between is picked up.
+    public void ApplyStrings()
+    {
+        ((Button)Content).ToolTip = S.T("Click-through ON — click to restore mouse input",
+            "クリック透過中 — クリックでマウス操作を復帰");
     }
 
     // Positions this window exactly over the given element (usually the

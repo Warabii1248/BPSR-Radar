@@ -14,8 +14,7 @@
          claiming a released version's number, and two builds sharing one
          number is how a player's log stops identifying anything.
 
-         Development runs on 0.1.6.x: 0.1.5 is the last release, 0.1.6 is the
-         line being worked on, and the fourth part is the commit count, so
+         Requested test builds use 0.1.7.x. The fourth part is the commit count, so
          every dev build has its own number without anyone choosing one.
          tools/publish.ps1 fills it in; this value is only the fallback for a
          plain `dotnet build`.

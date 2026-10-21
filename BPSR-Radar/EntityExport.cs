@@ -29,11 +29,11 @@ internal static class EntityExport
     // record it already found and barely consults this file.
     private const int SettledMs = 1000;
 
-    // It is not fine right after a field transition. SetScene clears the
-    // entity list, and until this file names a monster again the helper can
-    // neither re-adopt the record nor scan for one -- it sits in its
-    // no_targets gate. A second of publishing lag lands directly in the
-    // delay before the first target appears in the new field.
+    // It is not fine right after a field or channel transition. SetScene and
+    // ResetForWorldEntry clear the entity list, and until this file names a
+    // monster again the helper can neither re-adopt the record nor scan for
+    // one -- it sits in its no_targets gate. A second of publishing lag lands
+    // directly in the delay before the first target appears in the new world.
     private const int AfterSceneChangeMs = 250;
 
     // How long to keep publishing at the faster rate. Long enough to cover

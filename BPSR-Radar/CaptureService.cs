@@ -58,11 +58,10 @@ internal static class CaptureService
 
             netCap.RegisterProxyHandler((uint)EProxyServiceId.World, (uint)BpsrRadar.Capture.ServiceMethods.WorldProxy.GetUserControlInfo, ProcessUserControlInfo);
 
-            // Lock-on target via packets: WorldActivityNtf ClientTargetChange
-            // (0x300B) carries TargetUuid at field 4. Observed on both the
-            // server->client notify and the client->server proxy path, so
-            // register both. Packet-derived targets are instant and need no
-            // memory scan.
+            // WorldActivityNtf ClientTargetChange (0x300B) carries a target
+            // UUID at field 4 on both paths. It also moves for automatic or
+            // attack targets, so it is diagnostic input only; manual-lock
+            // display remains owned by the memory helper's measured flag.
             netCap.RegisterNotifyHandler((ulong)EServiceId.WorldActivityNtf,
                 (uint)BpsrRadar.Capture.ServiceMethods.WorldActivityNtf.ClientTargetChange,
                 ProcessClientTargetChange);
@@ -125,6 +124,10 @@ internal static class CaptureService
         }
 
         var vData = EnterScene.Parser.ParseFrom(payloadBuffer);
+        // EnterScene is a world-instance boundary even when the level-map id
+        // stays the same (for example, a channel transfer). Clear the old AOI
+        // before applying the new instance's player attributes.
+        TrackerLog.Write(RadarTracker.ResetForWorldEntry());
         var playerEnt = vData.EnterSceneInfo?.PlayerEnt;
         if (playerEnt?.Attrs?.Attrs != null)
         {

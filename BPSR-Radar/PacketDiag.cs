@@ -58,6 +58,13 @@ internal static class PacketDiag
 
     public static void WatchUuid(long uuid)
     {
+        // Every line it would emit goes through Append, a no-op with the log
+        // off -- after parsing up to 300 packets under the capture's lock.
+        if (!DiagLog)
+        {
+            return;
+        }
+
         lock (gate)
         {
             watchUuid = uuid;
@@ -82,6 +89,13 @@ internal static class PacketDiag
         if (DumpPath != null)
         {
             WriteDumpLine(flow, serviceId, methodId, payload, packetTimeUtc);
+        }
+
+        // The ring only feeds the watch dumps, which Append drops when the log
+        // is off. Filling it anyway copied every packet for nothing.
+        if (!DiagLog)
+        {
+            return;
         }
 
         var e = new Entry

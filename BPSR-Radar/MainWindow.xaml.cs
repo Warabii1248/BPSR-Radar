@@ -44,13 +44,19 @@ public partial class MainWindow : Window
     private static extern IntPtr SendMessage(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll")]
     private static extern bool ReleaseCapture();
+    [DllImport("user32.dll")]
+    private static extern bool SetWindowPos(IntPtr hwnd, IntPtr insertAfter, int x, int y, int cx, int cy, uint flags);
+    private static readonly IntPtr HwndTopmost = new(-1);
+    private const uint SwpNoSize = 0x1;
+    private const uint SwpNoMove = 0x2;
+    private const uint SwpNoActivate = 0x10;
 
     private readonly DispatcherTimer refreshTimer;
     private readonly DispatcherTimer settingsSaveTimer;
-    private Popup? settingsPopup;
+    private SettingsWindow? settingsWindow;
     private TargetOverlayWindow? targetOverlay;
+    private EnemyListWindow? enemyList;
     private ClickThroughGuardWindow? clickThroughGuard;
-    private bool overlaySectionOpen;
 
     public MainWindow()
     {
@@ -68,9 +74,9 @@ public partial class MainWindow : Window
             }
         }
         Topmost = settings.TopMost;
-        PinButton.Opacity = settings.TopMost ? 1.0 : 0.45;
-        ThroughButton.Opacity = settings.ClickThrough ? 1.0 : 0.45;
-        LockButton.Opacity = settings.LockTargetEnabled ? 1.0 : 0.45;
+        SetPinLook(settings.TopMost);
+        SetToggleLook(ThroughButton, settings.ClickThrough);
+        SetToggleLook(LockButton, settings.LockTargetEnabled);
         RootBrush.Opacity = settings.BackgroundOpacity;
 
         ApplyStrings();
@@ -79,18 +85,26 @@ public partial class MainWindow : Window
         {
             settings.TopMost = !settings.TopMost;
             Topmost = settings.TopMost;
-            PinButton.Opacity = settings.TopMost ? 1.0 : 0.45;
+            SetPinLook(settings.TopMost);
             RadarSettings.Save();
         };
         ThroughButton.Click += (_, _) => ToggleClickThrough();
         LockButton.Click += (_, _) =>
         {
             settings.LockTargetEnabled = !settings.LockTargetEnabled;
-            LockButton.Opacity = settings.LockTargetEnabled ? 1.0 : 0.45;
+            SetToggleLook(LockButton, settings.LockTargetEnabled);
             SyncTargetOverlay();
             RadarSettings.Save();
+            // The open settings window shows the lock switch and the rows that
+            // depend on it; showing the overlay also changes the Z order.
+            settingsWindow?.Rebuild();
+            KeepSettingsWindowOnTop();
         };
-        SettingsButton.Click += (_, _) => ToggleSettingsPopup();
+        // Without a background the title bar's empty space is not hit-tested,
+        // so only the 16px caption text could be grabbed to move the window.
+        TitleBar.Background = System.Windows.Media.Brushes.Transparent;
+        // The only way to open the settings window.
+        SettingsButton.Click += (_, _) => OpenSettingsWindow();
         CloseButton.Click += (_, _) => Close();
 
         refreshTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
@@ -128,7 +142,7 @@ public partial class MainWindow : Window
             QueueSettingsSave();
         };
 
-        Loaded += (_, _) => SyncTargetOverlay();
+        Loaded += (_, _) => { SyncTargetOverlay(); SyncEnemyList(); };
     }
 
     private void QueueSettingsSave()
@@ -157,6 +171,25 @@ public partial class MainWindow : Window
             targetOverlay = null;
         }
     }
+
+    private void SyncEnemyList()
+    {
+        if (RadarSettings.Instance.EnemyListEnabled)
+        {
+            enemyList ??= new EnemyListWindow { Owner = this };
+            enemyList.ApplySettings();
+            enemyList.Show();
+            enemyList.SetSnapshot(RadarTracker.GetSnapshot(RadarSettings.Instance), ActiveTargetUuid);
+        }
+        else if (enemyList != null)
+        {
+            enemyList.Close();
+            enemyList = null;
+        }
+    }
+
+    private static long ActiveTargetUuid => RadarSettings.Instance.LockTargetEnabled
+        ? LockTargetService.CurrentTargetUuid : 0;
 
     protected override void OnSourceInitialized(EventArgs e)
     {
@@ -203,7 +236,9 @@ public partial class MainWindow : Window
             Dispatcher.BeginInvoke(() =>
             {
                 WindowPlacement.EnsureOnScreen(this);
+                settingsWindow?.KeepInWorkArea();
                 targetOverlay?.EnsureVisible();
+                enemyList?.EnsureVisible();
             });
         }
         return IntPtr.Zero;
@@ -223,6 +258,23 @@ public partial class MainWindow : Window
         }
     }
 
+    // A toggle in the title bar: ON is the accent colour with a line under
+    // the button (the template shows it for Tag="on"), OFF a muted grey.
+    private static void SetToggleLook(Button button, bool on)
+    {
+        button.Foreground = new System.Windows.Media.SolidColorBrush(on
+            ? System.Windows.Media.Color.FromRgb(0x3F, 0xA7, 0xAD)
+            : System.Windows.Media.Color.FromRgb(0x7F, 0x9A, 0x9E));
+        button.Tag = on ? "on" : null;
+    }
+
+    // Segoe Fluent Icons: Pinned (filled) when on top, Pin (outline) when not.
+    private void SetPinLook(bool on)
+    {
+        PinButton.Content = on ? "" : "";
+        SetToggleLook(PinButton, on);
+    }
+
     private void ApplyStrings()
     {
         PinButton.ToolTip = S.T("TopMost", "常に最前面");
@@ -239,7 +291,7 @@ public partial class MainWindow : Window
         var settings = RadarSettings.Instance;
         settings.ClickThrough = !settings.ClickThrough;
         ApplyClickThrough();
-        ThroughButton.Opacity = settings.ClickThrough ? 1.0 : 0.45;
+        SetToggleLook(ThroughButton, settings.ClickThrough);
         RadarSettings.Save();
     }
 
@@ -258,6 +310,7 @@ public partial class MainWindow : Window
         // toggle button so click-through can always be switched back off.
         WindowPlacement.SetClickThrough(this, RadarSettings.Instance.ClickThrough);
         targetOverlay?.SyncClickThrough();
+        enemyList?.SyncClickThrough();
         SyncClickThroughGuard();
     }
 
@@ -265,13 +318,10 @@ public partial class MainWindow : Window
     {
         if (RadarSettings.Instance.ClickThrough)
         {
-            if (settingsPopup != null)
-            {
-                settingsPopup.IsOpen = false;
-            }
             clickThroughGuard ??= new ClickThroughGuardWindow { Owner = this };
             clickThroughGuard.Clicked -= OnClickThroughGuardClicked;
             clickThroughGuard.Clicked += OnClickThroughGuardClicked;
+            clickThroughGuard.ApplyStrings();
             clickThroughGuard.TrackTo(ThroughButton);
             clickThroughGuard.Show();
         }
@@ -291,27 +341,20 @@ public partial class MainWindow : Window
         }
     }
 
-    private void MapCanvas_MouseWheel(object sender, MouseWheelEventArgs e)
-    {
-        var settings = RadarSettings.Instance;
-        settings.Zoom = Math.Clamp(settings.Zoom + (e.Delta > 0 ? 0.25f : -0.25f), 0.5f, 4f);
-    }
+    private void MapCanvas_MouseWheel(object sender, MouseWheelEventArgs e) =>
+        SetZoom(RadarSettings.Instance.Zoom + (e.Delta > 0 ? 0.25f : -0.25f));
 
-    private void ZoomOut_Click(object sender, RoutedEventArgs e)
-    {
-        var settings = RadarSettings.Instance;
-        settings.Zoom = Math.Clamp(settings.Zoom - 0.25f, 0.5f, 4f);
-    }
+    private void ZoomOut_Click(object sender, RoutedEventArgs e) => SetZoom(RadarSettings.Instance.Zoom - 0.25f);
 
-    private void ZoomIn_Click(object sender, RoutedEventArgs e)
-    {
-        var settings = RadarSettings.Instance;
-        settings.Zoom = Math.Clamp(settings.Zoom + 0.25f, 0.5f, 4f);
-    }
+    private void ZoomIn_Click(object sender, RoutedEventArgs e) => SetZoom(RadarSettings.Instance.Zoom + 0.25f);
 
-    private void Fit_Click(object sender, RoutedEventArgs e)
+    private void Fit_Click(object sender, RoutedEventArgs e) => SetZoom(1f);
+
+    // Saved like every other setting, not only when the window closes.
+    private void SetZoom(float zoom)
     {
-        RadarSettings.Instance.Zoom = 1f;
+        RadarSettings.Instance.Zoom = float.IsFinite(zoom) ? Math.Clamp(zoom, 0.5f, 4f) : 1f;
+        QueueSettingsSave();
     }
 
     // Raised from the capture thread and from the lock-target service loop,
@@ -325,9 +368,19 @@ public partial class MainWindow : Window
             try { Dispatcher.BeginInvoke(new Action(OnTargetChanged)); } catch { }
             return;
         }
-        targetOverlay?.SetText(LockTargetService.StatusText, LockTargetService.TargetIsStrong);
+        UpdateTargetOverlay();
+        enemyList?.SetTarget(ActiveTargetUuid);
         MapCanvas.LockTargetUuid = LockTargetService.CurrentTargetUuid;
         MapCanvas.InvalidateVisual();
+    }
+
+    private void UpdateTargetOverlay()
+    {
+        if (targetOverlay == null) return;
+        targetOverlay.SetText(LockTargetService.StatusText, LockTargetService.TargetKind);
+        long uuid = LockTargetService.CurrentTargetUuid;
+        bool hasHp = RadarTracker.TryGetHp(uuid, out long hp, out long maxHp);
+        targetOverlay.SetHp(uuid != 0, hasHp, hp, maxHp);
     }
 
     private void Refresh()
@@ -337,7 +390,8 @@ public partial class MainWindow : Window
         MapCanvas.Snapshot = snapshot;
         MapCanvas.LockTargetUuid = LockTargetService.CurrentTargetUuid;
         MapCanvas.InvalidateVisual();
-        targetOverlay?.SetText(LockTargetService.StatusText, LockTargetService.TargetIsStrong);
+        UpdateTargetOverlay();
+        enemyList?.SetSnapshot(snapshot, ActiveTargetUuid);
         if (clickThroughGuard?.IsVisible == true)
         {
             clickThroughGuard.TrackTo(ThroughButton);
@@ -351,233 +405,72 @@ public partial class MainWindow : Window
             : $" · {S.T("capture off", "キャプチャ停止")}");
         FitButton.Visibility = settings.ViewMode == RadarViewMode.ScanOverview
             ? Visibility.Visible : Visibility.Collapsed;
-        StatusText.Text = $"{S.T("Scene", "シーン")} {scene} · {entityCount} · x{settings.Zoom:0.##}{target}{capture}";
+        // A capture problem goes first: trimming cuts the end of this line.
+        string head = $"{S.T("Scene", "シーン")} {scene} · {entityCount} · x{settings.Zoom:0.##}";
+        StatusText.Text = string.IsNullOrEmpty(capture)
+            ? $"{head}{target}"
+            : $"{capture.TrimStart(' ', '·')} · {head}{target}";
     }
 
-    private void ToggleSettingsPopup()
+    // Opens the settings window, or brings the open one to the front.
+    private void OpenSettingsWindow()
     {
-        if (settingsPopup?.IsOpen == true)
+        if (settingsWindow != null)
         {
-            settingsPopup.IsOpen = false;
+            settingsWindow.Activate();
             return;
         }
 
-        var settings = RadarSettings.Instance;
-        var panel = new StackPanel { Margin = new Thickness(10) };
-
-        panel.Children.Add(MakeCheck(S.T("Self", "自分"), settings.ShowSelf, v => settings.ShowSelf = v));
-        panel.Children.Add(MakeCheck(S.T("Party", "パーティー"), settings.ShowParty, v => settings.ShowParty = v));
-        panel.Children.Add(MakeCheck(S.T("Other players", "他プレイヤー"), settings.ShowPlayers, v => settings.ShowPlayers = v));
-        panel.Children.Add(MakeCheck(S.T("Normal monsters", "通常モンスター"), settings.ShowNormalMonsters, v => settings.ShowNormalMonsters = v));
-        panel.Children.Add(MakeCheck(S.T("Elite", "エリート"), settings.ShowEliteMonsters, v => settings.ShowEliteMonsters = v));
-        panel.Children.Add(MakeCheck(S.T("Boss", "ボス"), settings.ShowBosses, v => settings.ShowBosses = v));
-        panel.Children.Add(MakeCheck(S.T("Unknown monsters", "種別不明"), settings.ShowUnknownMonsters, v => settings.ShowUnknownMonsters = v));
-        panel.Children.Add(MakeCheck(S.T("Gimmicks", "ギミック"), settings.ShowGimmicks, v => settings.ShowGimmicks = v));
-        panel.Children.Add(MakeCheck(S.T("Self direction", "自分の向き"), settings.ShowSelfDirection, v => settings.ShowSelfDirection = v));
-        panel.Children.Add(MakeCheck(S.T("Distance rings", "距離リング"), settings.ShowDistanceRings, v => settings.ShowDistanceRings = v));
-        panel.Children.Add(MakeCheck(S.T("Ring labels", "リング距離表示"), settings.ShowDistanceRingLabels, v => settings.ShowDistanceRingLabels = v));
-        panel.Children.Add(MakeCheck(S.T("Lock target", "ロック対象"), settings.LockTargetEnabled, v => { settings.LockTargetEnabled = v; LockButton.Opacity = v ? 1.0 : 0.45; SyncTargetOverlay(); }));
-
-        var overlayPanel = new StackPanel { Margin = new Thickness(10, 4, 0, 0) };
-        overlayPanel.Children.Add(MakeCheck(S.T("Show overlay", "オーバーレイ表示"), settings.TargetOverlayEnabled, v =>
+        var window = new SettingsWindow(new SettingsCallbacks
         {
-            settings.TargetOverlayEnabled = v;
-            SyncTargetOverlay();
-        }));
-        overlayPanel.Children.Add(MakeCheck(S.T("Always on top", "常に最前面"), settings.TargetOverlayTopMost, v => { settings.TargetOverlayTopMost = v; targetOverlay?.ApplySettings(); }));
-        overlayPanel.Children.Add(MakeSliderRow(S.T("Opacity", "透明度"), (float)settings.TargetOverlayOpacity, 0.15f, 1f, v => { settings.TargetOverlayOpacity = v; targetOverlay?.ApplySettings(); }));
-        overlayPanel.Children.Add(MakeSliderRow(S.T("Text size", "文字サイズ"), (float)settings.TargetOverlayFontSize, 9f, 32f, v => { settings.TargetOverlayFontSize = v; targetOverlay?.ApplySettings(); }));
-        overlayPanel.Children.Add(MakeSliderRow(S.T("Frame width", "枠の太さ"), (float)settings.TargetOverlayBorderThickness, 0f, 4f, v => { settings.TargetOverlayBorderThickness = v; targetOverlay?.ApplySettings(); }));
-        overlayPanel.Children.Add(MakeColorRow(S.T("Frame", "枠色"), () => settings.TargetOverlayBorderArgb, v => settings.TargetOverlayBorderArgb = v));
-        overlayPanel.Children.Add(MakeColorRow(S.T("Background", "背景色"), () => settings.TargetOverlayBackgroundArgb, v => settings.TargetOverlayBackgroundArgb = v));
-        overlayPanel.Children.Add(MakeColorRow(S.T("Text", "文字色"), () => settings.TargetOverlayTextArgb, v => settings.TargetOverlayTextArgb = v));
-        var overlayExpander = new Expander
+            SyncTargetOverlay = SyncTargetOverlay,
+            SyncEnemyList = SyncEnemyList,
+            ApplyTargetOverlay = () => targetOverlay?.ApplySettings(),
+            ApplyEnemyList = () => enemyList?.ApplySettings(),
+            BackgroundOpacityChanged = v => RootBrush.Opacity = v,
+            LockTargetChanged = v => SetToggleLook(LockButton, v),
+            LanguageChanged = OnLanguageChanged,
+            AfterWindowChange = KeepSettingsWindowOnTop,
+        })
         {
-            Header = S.T("Target overlay", "ターゲットオーバーレイ"),
-            Foreground = System.Windows.Media.Brushes.White,
-            IsExpanded = overlaySectionOpen,
-            Content = overlayPanel,
+            Owner = this,
         };
-        overlayExpander.Expanded += (_, _) => overlaySectionOpen = true;
-        overlayExpander.Collapsed += (_, _) => overlaySectionOpen = false;
-        panel.Children.Add(overlayExpander);
-
-        panel.Children.Add(new Separator { Margin = new Thickness(0, 6, 0, 6) });
-
-        var modeRow = new StackPanel { Orientation = Orientation.Horizontal };
-        modeRow.Children.Add(new TextBlock { Text = S.T("View:", "表示:"), VerticalAlignment = VerticalAlignment.Center, Width = 50 });
-        var modeCombo = new ComboBox { Width = 110 };
-        AddComboItem(modeCombo, RadarViewMode.MiniMap, S.T("Mini map", "ミニマップ"));
-        AddComboItem(modeCombo, RadarViewMode.ScanOverview, S.T("Scan overview", "全体スキャン"));
-        SelectComboItem(modeCombo, settings.ViewMode);
-        modeCombo.SelectionChanged += (_, _) =>
+        window.Closed += (_, _) =>
         {
-            if (modeCombo.SelectedItem is ComboBoxItem item)
+            settingsWindow = null;
+            // Back to the resting look it has always had, not the muted OFF grey.
+            SettingsButton.ClearValue(Control.ForegroundProperty);
+            SettingsButton.Tag = null;
+        };
+        settingsWindow = window;
+        SetToggleLook(SettingsButton, true);
+        window.Show();
+    }
+
+    private void OnLanguageChanged()
+    {
+        ApplyStrings();
+        // HP units (億 / B) and list labels are language-dependent.
+        targetOverlay?.ApplySettings();
+        enemyList?.ApplySettings();
+        settingsWindow?.Rebuild();
+    }
+
+    // Showing the overlay or enemy list, or switching one to Always on top,
+    // re-inserts it together with its owner (this window) at the top of the
+    // topmost band -- above the open settings window, which then sat behind
+    // the radar. Measured 2026-10-21 with a minimal repro: ShowActivated=false
+    // does not prevent it; raising the window again once idle does. (That repro
+    // was a popup; the target is now the settings window's own HWND.)
+    private void KeepSettingsWindowOnTop()
+    {
+        Dispatcher.BeginInvoke(() =>
+        {
+            if (settingsWindow != null && new WindowInteropHelper(settingsWindow).Handle is var handle && handle != IntPtr.Zero)
             {
-                settings.ViewMode = (RadarViewMode)item.Tag;
-                RadarSettings.Save();
+                SetWindowPos(handle, HwndTopmost, 0, 0, 0, 0, SwpNoSize | SwpNoMove | SwpNoActivate);
             }
-        };
-        modeRow.Children.Add(modeCombo);
-        panel.Children.Add(modeRow);
-
-        var labelRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 4, 0, 0) };
-        labelRow.Children.Add(new TextBlock { Text = S.T("Labels:", "ラベル:"), VerticalAlignment = VerticalAlignment.Center, Width = 50 });
-        var labelCombo = new ComboBox { Width = 110 };
-        AddComboItem(labelCombo, RadarLabelMode.None, S.T("None", "なし"));
-        AddComboItem(labelCombo, RadarLabelMode.PartyAndBoss, S.T("Party + Boss", "PT+ボス"));
-        AddComboItem(labelCombo, RadarLabelMode.All, S.T("All", "すべて"));
-        SelectComboItem(labelCombo, settings.LabelMode);
-        labelCombo.SelectionChanged += (_, _) =>
-        {
-            if (labelCombo.SelectedItem is ComboBoxItem item)
-            {
-                settings.LabelMode = (RadarLabelMode)item.Tag;
-                RadarSettings.Save();
-            }
-        };
-        labelRow.Children.Add(labelCombo);
-        panel.Children.Add(labelRow);
-
-        panel.Children.Add(MakeSliderRow(S.T("Enemy range", "敵の表示距離"), settings.EnemyMaxDistanceMeters, 5, 500, v => settings.EnemyMaxDistanceMeters = v));
-        panel.Children.Add(MakeSliderRow(S.T("Map range", "マップ範囲"), settings.BaseDisplayRangeMeters, 20, 500, v => settings.BaseDisplayRangeMeters = v));
-        panel.Children.Add(MakeSliderRow(S.T("Background", "背景の濃さ"), settings.BackgroundOpacity, 0.1f, 1f, v => { settings.BackgroundOpacity = v; RootBrush.Opacity = v; }));
-
-        panel.Children.Add(new Separator { Margin = new Thickness(0, 6, 0, 6) });
-
-        var langRow = new StackPanel { Orientation = Orientation.Horizontal };
-        langRow.Children.Add(new TextBlock { Text = S.T("Language:", "言語:"), VerticalAlignment = VerticalAlignment.Center, Width = 50 });
-        var langCombo = new ComboBox { Width = 110 };
-        AddComboItem(langCombo, "en", "English");
-        AddComboItem(langCombo, "ja", "日本語");
-        SelectComboItem(langCombo, settings.Language);
-        langCombo.SelectionChanged += (_, _) =>
-        {
-            if (langCombo.SelectedItem is ComboBoxItem item)
-            {
-                settings.Language = (string)item.Tag;
-                RadarSettings.Save();
-                ApplyStrings();
-                settingsPopup!.IsOpen = false;
-                ToggleSettingsPopup();
-            }
-        };
-        langRow.Children.Add(langCombo);
-        panel.Children.Add(langRow);
-
-        settingsPopup = new Popup
-        {
-            Child = new Border
-            {
-                Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(18, 28, 32)),
-                BorderBrush = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(70, 95, 100)),
-                BorderThickness = new Thickness(1),
-                CornerRadius = new CornerRadius(8),
-                Child = new ScrollViewer
-                {
-                    MaxHeight = 460,
-                    VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-                    Content = panel,
-                },
-            },
-            PlacementTarget = SettingsButton,
-            Placement = PlacementMode.Bottom,
-            StaysOpen = false,
-            AllowsTransparency = true,
-        };
-        settingsPopup.Closed += (_, _) => RadarSettings.Save();
-        settingsPopup.IsOpen = true;
-    }
-
-    private static void AddComboItem(ComboBox combo, object tag, string text)
-    {
-        combo.Items.Add(new ComboBoxItem { Tag = tag, Content = text });
-    }
-
-    private static void SelectComboItem(ComboBox combo, object tag)
-    {
-        foreach (ComboBoxItem item in combo.Items)
-        {
-            if (Equals(item.Tag, tag))
-            {
-                combo.SelectedItem = item;
-                return;
-            }
-        }
-        if (combo.Items.Count > 0)
-        {
-            combo.SelectedIndex = 0;
-        }
-    }
-
-    private static CheckBox MakeCheck(string label, bool value, Action<bool> onChange)
-    {
-        var check = new CheckBox { Content = label, IsChecked = value, Foreground = System.Windows.Media.Brushes.White };
-        check.Checked += (_, _) => { onChange(true); RadarSettings.Save(); };
-        check.Unchecked += (_, _) => { onChange(false); RadarSettings.Save(); };
-        return check;
-    }
-
-    private static readonly uint[] OverlayPalette =
-    [
-        0xFFFFFFFF, 0xFF55E0E6, 0xFF7BE37B, 0xFFE3D07B, 0xFFE39A5B,
-        0xFFE35B5B, 0xFFD07BE3, 0xFF7BA8E3, 0xFF9AA5A8, 0xFF20262A, 0x00000000,
-    ];
-
-    private FrameworkElement MakeColorRow(string label, Func<uint> get, Action<uint> set)
-    {
-        var row = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 4, 0, 0) };
-        row.Children.Add(new TextBlock { Text = label, Width = 80, VerticalAlignment = VerticalAlignment.Center });
-        foreach (var argb in OverlayPalette)
-        {
-            var color = System.Windows.Media.Color.FromArgb(
-                (byte)(argb >> 24), (byte)(argb >> 16), (byte)(argb >> 8), (byte)argb);
-            var swatch = new Border
-            {
-                Width = 15, Height = 15, Margin = new Thickness(1),
-                CornerRadius = new CornerRadius(3),
-                BorderThickness = new Thickness(1),
-                BorderBrush = new System.Windows.Media.SolidColorBrush(
-                    argb == get()
-                        ? System.Windows.Media.Color.FromRgb(0xFF, 0xFF, 0xFF)
-                        : System.Windows.Media.Color.FromRgb(0x55, 0x5F, 0x62)),
-                Background = new System.Windows.Media.SolidColorBrush(color),
-                ToolTip = argb == 0 ? "Transparent" : $"#{argb:X8}",
-                Cursor = Cursors.Hand,
-            };
-            ToolTipService.SetInitialShowDelay(swatch, 0);
-            var captured = argb;
-            swatch.MouseLeftButtonDown += (_, e) =>
-            {
-                set(captured);
-                RadarSettings.Save();
-                targetOverlay?.ApplySettings();
-                settingsPopup!.IsOpen = false;
-                ToggleSettingsPopup();
-                e.Handled = true;
-            };
-            row.Children.Add(swatch);
-        }
-        return row;
-    }
-
-    private static FrameworkElement MakeSliderRow(string label, float value, float min, float max, Action<float> onChange)
-    {
-        var row = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 4, 0, 0) };
-        row.Children.Add(new TextBlock { Text = label, Width = 80, VerticalAlignment = VerticalAlignment.Center });
-        var slider = new Slider
-        {
-            Width = 130,
-            Minimum = min,
-            Maximum = max,
-            Value = value,
-            VerticalAlignment = VerticalAlignment.Center,
-            AutoToolTipPlacement = AutoToolTipPlacement.TopLeft,
-            AutoToolTipPrecision = (max - min) <= 4 ? 2 : 0,
-        };
-        slider.ValueChanged += (_, e) => { onChange((float)e.NewValue); };
-        row.Children.Add(slider);
-        return row;
+        }, DispatcherPriority.ApplicationIdle);
     }
 
     protected override void OnClosed(EventArgs e)
@@ -586,7 +479,11 @@ public partial class MainWindow : Window
         // The service is static and outlives the window during shutdown, so
         // an event left attached would keep dispatching into a closed one.
         LockTargetService.TargetChanged -= OnTargetChanged;
+        // An owned window closes with its owner anyway; closing it here fixes
+        // the order of its settings save relative to this window's.
+        settingsWindow?.Close();
         targetOverlay?.Close();
+        enemyList?.Close();
         clickThroughGuard?.Close();
         var hwnd = new WindowInteropHelper(this).Handle;
         if (hwnd != IntPtr.Zero)

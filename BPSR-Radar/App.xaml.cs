@@ -66,6 +66,10 @@ public partial class App : Application
             }
         }
 
+        // A check only reads. It still opens MainWindow (StartupUri), whose
+        // close saved over the player's settings.json -- and a build older
+        // than a key drops that key (2026-10-20: the HP display settings).
+        RadarSettings.ReadOnly = Array.IndexOf(e.Args, "--check") >= 0;
         RadarSettings.Load();
         GameDataTables.Load();
         RadarTracker.LoadNameCache();
@@ -110,8 +114,11 @@ public partial class App : Application
         LockTargetService.Shutdown();
         CaptureService.Stop();
         PacketDiag.Close();
-        RadarTracker.SaveNameCache();
-        RadarSettings.Save();
+        if (!RadarSettings.ReadOnly)
+        {
+            RadarTracker.SaveNameCache();
+            RadarSettings.Save();
+        }
         base.OnExit(e);
     }
 }

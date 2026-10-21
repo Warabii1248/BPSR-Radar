@@ -103,4 +103,54 @@ internal static class WindowPlacement
         w.Left = info.rcWork.Left / sx + 24;
         w.Top = info.rcWork.Top / sy + 24;
     }
+
+    // Work area (DIPs) of the monitor nearest to the DIP rect; the primary
+    // monitor's if the query fails.
+    public static Rect WorkAreaNear(Window w, Rect rect)
+    {
+        var (sx, sy) = DpiScale(w);
+        var r = new RECT
+        {
+            Left = (int)(rect.Left * sx),
+            Top = (int)(rect.Top * sy),
+            Right = (int)(rect.Right * sx) + 1,
+            Bottom = (int)(rect.Bottom * sy) + 1,
+        };
+        var info = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
+        if (!GetMonitorInfo(MonitorFromRect(ref r, MonitorDefaultToNearest), ref info))
+        {
+            return SystemParameters.WorkArea;
+        }
+        return new Rect(info.rcWork.Left / sx, info.rcWork.Top / sy,
+            (info.rcWork.Right - info.rcWork.Left) / sx, (info.rcWork.Bottom - info.rcWork.Top) / sy);
+    }
+
+    // A growing list may use the work area up to its full height. Its top is
+    // computed from anchorTop, where the player put it: moved up only as far
+    // as the footer needs to stay above the taskbar, and back down when the
+    // list shrinks. moveTop=false (during a drag) only caps the height, so
+    // the window can be dragged across a monitor boundary.
+    public static double FitOverlayHeight(Window w, double desiredHeight, double anchorTop = double.NaN,
+        bool moveTop = true)
+    {
+        var (sx, sy) = DpiScale(w);
+        double left = double.IsFinite(w.Left) ? w.Left : 0;
+        double top = double.IsFinite(anchorTop) ? anchorTop : double.IsFinite(w.Top) ? w.Top : 0;
+        var monitor = MonitorFromPoint(new POINT
+        {
+            X = (int)((left + w.Width / 2) * sx),
+            Y = (int)((top + 8) * sy),
+        }, MonitorDefaultToNearest);
+        var info = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
+        if (!GetMonitorInfo(monitor, ref info)) return desiredHeight;
+        double workTop = info.rcWork.Top / sy;
+        double workBottom = info.rcWork.Bottom / sy;
+        double height = Math.Clamp(desiredHeight, 1, Math.Max(1, workBottom - workTop));
+        if (moveTop && double.IsFinite(w.Top))
+        {
+            double fittedTop = Math.Clamp(top, workTop, Math.Max(workTop, workBottom - height));
+            if (Math.Abs(w.Top - fittedTop) > 0.1) w.Top = fittedTop;
+        }
+        return height;
+    }
 }

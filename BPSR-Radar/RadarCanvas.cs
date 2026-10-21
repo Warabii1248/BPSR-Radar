@@ -40,6 +40,51 @@ internal sealed class RadarCanvas : FrameworkElement
     public RadarSnapshot? Snapshot { get; set; }
     public long LockTargetUuid { get; set; }
 
+    // Offscreen-check hooks (tools/RadarCanvasCheck): when set, every drawn text
+    // rect (all / distance-ring labels only) is appended; SelfPointForTest is
+    // the self marker position of the last render, null when it was not drawn.
+    internal List<Rect>? LabelBoundsForTest { get; set; }
+    internal List<Rect>? RingLabelBoundsForTest { get; set; }
+    internal Point? SelfPointForTest { get; private set; }
+
+    // Map rect of the render in progress; labels are kept inside it.
+    private Rect _clipRect;
+    private double _pixelsPerDip = 1;
+
+    // The radar redraws every 100ms. Cloning a brush per marker and laying out
+    // every name again made each frame ~2.6MB of garbage (300 enemies, all
+    // labels). Faded copies are frozen and shared, opacity on a 1/100 grid.
+    private static readonly Dictionary<(Brush, int), Brush> FadedBrushes = new();
+    private static readonly Dictionary<(Brush, int, double), Pen> FadedPens = new();
+
+    // Text laid out this frame and the last; anything not drawn for a whole
+    // frame is dropped, so the cache stays the size of what is on screen.
+    // Kept as a frozen drawing as well: DrawText rebuilds the glyph runs on
+    // every call, which was most of what remained of a frame's cost.
+    private Dictionary<(string, bool, Brush), LabelText> _texts = new();
+    private Dictionary<(string, bool, Brush), LabelText> _textsBefore = new();
+
+    private sealed class LabelText
+    {
+        public LabelText(FormattedText text)
+        {
+            Width = text.Width;
+            Height = text.Height;
+            var group = new DrawingGroup();
+            using (var dc = group.Open())
+            {
+                dc.DrawText(text, new Point(0, 0));
+            }
+            group.Freeze();
+            Glyphs = group;
+        }
+
+        public double Width { get; }
+        public double Height { get; }
+        public Drawing Glyphs { get; }
+    }
+    private double _textsPixelsPerDip;
+
     static RadarCanvas()
     {
         GridPen.Freeze();
@@ -67,13 +112,23 @@ internal sealed class RadarCanvas : FrameworkElement
     protected override void OnRender(DrawingContext dc)
     {
         var settings = RadarSettings.Instance;
+        SelfPointForTest = null;
+        _pixelsPerDip = VisualTreeHelper.GetDpi(this).PixelsPerDip;
+        if (_pixelsPerDip != _textsPixelsPerDip)
+        {
+            _texts.Clear();
+            _textsBefore.Clear();
+            _textsPixelsPerDip = _pixelsPerDip;
+        }
+        (_texts, _textsBefore) = (_textsBefore, _texts);
+        _texts.Clear();
         double side = Math.Max(60, Math.Min(ActualWidth, ActualHeight));
         var canvasMin = new Point((ActualWidth - side) * 0.5, (ActualHeight - side) * 0.5);
         var canvasSize = new Size(side, side);
         var canvasRect = new Rect(canvasMin, canvasSize);
+        _clipRect = canvasRect;
 
-        var bgBrush = new SolidColorBrush(MapBack.Color) { Opacity = settings.BackgroundOpacity };
-        dc.DrawRoundedRectangle(bgBrush, null, canvasRect, 6, 6);
+        dc.DrawRoundedRectangle(WithOpacity(MapBack, (float)settings.BackgroundOpacity), null, canvasRect, 6, 6);
 
         dc.PushClip(new RectangleGeometry(canvasRect));
         for (int i = 1; i < 4; i++)
@@ -88,7 +143,8 @@ internal sealed class RadarCanvas : FrameworkElement
         var center = new Point(canvasMin.X + side * 0.5, canvasMin.Y + side * 0.5);
         double mapRadiusPixels = Math.Max(20, side * 0.5 - 10);
         var snapshot = Snapshot;
-        if (snapshot?.Self == null)
+        if (snapshot?.Self == null ||
+            !float.IsFinite(snapshot.Self.Position.X) || !float.IsFinite(snapshot.Self.Position.Z))
         {
             DrawText(dc, S.T("Waiting for position…", "位置を待機中…"), center, WaitingBrush, centered: true);
             dc.Pop();
@@ -109,10 +165,6 @@ internal sealed class RadarCanvas : FrameworkElement
             }
 
             DrawEnemy(dc, point, enemy);
-            if (enemy.Uuid == LockTargetUuid && LockTargetUuid != 0)
-            {
-                dc.DrawEllipse(null, LockPen, point, 11, 11);
-            }
             if (settings.LabelMode == RadarLabelMode.All ||
                 (settings.LabelMode == RadarLabelMode.PartyAndBoss && enemy.Kind == RadarEntityKind.Boss))
             {
@@ -120,20 +172,37 @@ internal sealed class RadarCanvas : FrameworkElement
             }
         }
 
+        // Second pass so a later-drawn enemy cannot hide the lock ring.
+        if (LockTargetUuid != 0)
+        {
+            foreach (var enemy in snapshot.Enemies)
+            {
+                var point = WorldToScreen(enemy.Position, view.Origin, center, pixelsPerUnit);
+                if (enemy.Uuid == LockTargetUuid && InsideMap(point, center, mapRadiusPixels))
+                {
+                    dc.DrawEllipse(null, LockPen, point, 11, 11);
+                }
+            }
+        }
+
+        // Other players are labeled only in All; party members in PartyAndBoss and All.
+        bool labelPlayers = settings.LabelMode == RadarLabelMode.All;
+        bool labelParty = settings.LabelMode != RadarLabelMode.None;
         foreach (var player in snapshot.Players)
         {
-            DrawMember(dc, player, PlayerBack, PlayerFront, view.Origin, center, pixelsPerUnit, mapRadiusPixels, settings);
+            DrawMember(dc, player, PlayerBack, PlayerFront, view.Origin, center, pixelsPerUnit, mapRadiusPixels, settings, labelPlayers);
         }
 
         foreach (var member in snapshot.Party)
         {
-            DrawMember(dc, member, PartyBack, PartyFront, view.Origin, center, pixelsPerUnit, mapRadiusPixels, settings);
+            DrawMember(dc, member, PartyBack, PartyFront, view.Origin, center, pixelsPerUnit, mapRadiusPixels, settings, labelParty);
         }
 
         if (settings.ShowSelf)
         {
             if (InsideMap(selfPoint, center, mapRadiusPixels))
             {
+                SelfPointForTest = selfPoint;
                 if (settings.ShowSelfDirection && snapshot.Self.HeadingRadians.HasValue)
                 {
                     double heading = snapshot.Self.HeadingRadians.Value;
@@ -154,7 +223,7 @@ internal sealed class RadarCanvas : FrameworkElement
 
                 dc.DrawEllipse(WithOpacity(SelfBack, snapshot.Self.Opacity), null, selfPoint, 8, 8);
                 dc.DrawEllipse(WithOpacity(SelfFront, snapshot.Self.Opacity), null, selfPoint, 5, 5);
-                var crossPen = new Pen(WithOpacity(SelfCross, snapshot.Self.Opacity), 1.5);
+                var crossPen = WithOpacity(SelfCross, snapshot.Self.Opacity, 1.5);
                 dc.DrawLine(crossPen, selfPoint + new Vector(-7, 0), selfPoint + new Vector(7, 0));
                 dc.DrawLine(crossPen, selfPoint + new Vector(0, -7), selfPoint + new Vector(0, 7));
             }
@@ -163,10 +232,11 @@ internal sealed class RadarCanvas : FrameworkElement
         dc.Pop();
     }
 
-    private static (Vector3 Origin, float Range) CalculateView(RadarSnapshot snapshot, RadarSettings settings)
+    internal static (Vector3 Origin, float Range) CalculateView(RadarSnapshot snapshot, RadarSettings settings)
     {
         float worldUnitsPerMeter = GetWorldUnitsPerMeter(settings);
-        float miniMapRange = MathF.Max(1f, settings.BaseDisplayRangeMeters * worldUnitsPerMeter / settings.Zoom);
+        float zoom = float.IsFinite(settings.Zoom) && settings.Zoom > 0f ? settings.Zoom : 1f;
+        float miniMapRange = MathF.Max(1f, settings.BaseDisplayRangeMeters * worldUnitsPerMeter / zoom);
         if (settings.ViewMode == RadarViewMode.MiniMap || snapshot.Self == null)
         {
             return (snapshot.Self?.Position ?? Vector3.Zero, miniMapRange);
@@ -189,12 +259,18 @@ internal sealed class RadarCanvas : FrameworkElement
         float maxZ = points.Max(x => x.Z);
         var origin = new Vector3((minX + maxX) * 0.5f, self.Y, (minZ + maxZ) * 0.5f);
         float fitRange = MathF.Max(maxX - minX, maxZ - minZ) * 0.55f;
-        fitRange = Math.Clamp(fitRange, 1f, overviewMaxRange);
-        return (origin, fitRange / settings.Zoom);
+        // A tiny spread must not zoom in until every ring is hidden.
+        fitRange = Math.Clamp(fitRange, MathF.Min(10f * worldUnitsPerMeter, overviewMaxRange), overviewMaxRange);
+        float range = fitRange / zoom;
+        // Zoom must not push self out of view: keep it within 85% of the range on each axis.
+        float limit = range * 0.85f;
+        origin.X = Math.Clamp(origin.X, self.X - limit, self.X + limit);
+        origin.Z = Math.Clamp(origin.Z, self.Z - limit, self.Z + limit);
+        return (origin, range);
     }
 
     private void DrawMember(DrawingContext dc, RadarEntitySnapshot member, Brush back, Brush front,
-        Vector3 origin, Point center, double pixelsPerUnit, double mapRadiusPixels, RadarSettings settings)
+        Vector3 origin, Point center, double pixelsPerUnit, double mapRadiusPixels, RadarSettings settings, bool showLabel)
     {
         var point = WorldToScreen(member.Position, origin, center, pixelsPerUnit);
         bool clamped = false;
@@ -216,7 +292,7 @@ internal sealed class RadarCanvas : FrameworkElement
         {
             dc.DrawEllipse(null, LockPen, point, 12, 12);
         }
-        if (settings.LabelMode != RadarLabelMode.None)
+        if (showLabel)
         {
             string label = member.Name;
             if (clamped)
@@ -236,12 +312,14 @@ internal sealed class RadarCanvas : FrameworkElement
         }
 
         float worldUnitsPerMeter = GetWorldUnitsPerMeter(settings);
-        DrawDistanceRing(dc, center, mapRadiusPixels, viewRange, 10f * worldUnitsPerMeter, 10f, settings.ShowDistanceRing10m, settings.ShowDistanceRingLabels);
-        DrawDistanceRing(dc, center, mapRadiusPixels, viewRange, 20f * worldUnitsPerMeter, 20f, settings.ShowDistanceRing20m, settings.ShowDistanceRingLabels);
-        DrawDistanceRing(dc, center, mapRadiusPixels, viewRange, 30f * worldUnitsPerMeter, 30f, settings.ShowDistanceRing30m, settings.ShowDistanceRingLabels);
+        // Right edge of the last label drawn, so close rings do not stack their labels.
+        double lastLabelRight = double.NegativeInfinity;
+        DrawDistanceRing(dc, center, mapRadiusPixels, viewRange, 10f * worldUnitsPerMeter, 10f, settings.ShowDistanceRing10m, settings.ShowDistanceRingLabels, ref lastLabelRight);
+        DrawDistanceRing(dc, center, mapRadiusPixels, viewRange, 20f * worldUnitsPerMeter, 20f, settings.ShowDistanceRing20m, settings.ShowDistanceRingLabels, ref lastLabelRight);
+        DrawDistanceRing(dc, center, mapRadiusPixels, viewRange, 30f * worldUnitsPerMeter, 30f, settings.ShowDistanceRing30m, settings.ShowDistanceRingLabels, ref lastLabelRight);
     }
 
-    private void DrawDistanceRing(DrawingContext dc, Point center, double mapRadiusPixels, float viewRange, float worldDistance, float configuredDistance, bool enabled, bool showLabel)
+    private void DrawDistanceRing(DrawingContext dc, Point center, double mapRadiusPixels, float viewRange, float worldDistance, float configuredDistance, bool enabled, bool showLabel, ref double lastLabelRight)
     {
         double radius = worldDistance / viewRange * mapRadiusPixels;
         if (!enabled || radius > mapRadiusPixels)
@@ -250,10 +328,29 @@ internal sealed class RadarCanvas : FrameworkElement
         }
 
         dc.DrawEllipse(null, RingPen, center, radius, radius);
-        if (showLabel)
+        // Radius 22 keeps the label clear of the self heading arrow (tip at 17px).
+        if (showLabel && radius >= 22)
         {
             string unit = RadarSettings.Instance.DistanceCalibrationComplete ? "m" : "u";
-            DrawText(dc, $"{configuredDistance:0}{unit}", new Point(center.X + radius + 3, center.Y - 8), RingLabelBrush);
+            var ft = CreateText($"{configuredDistance:0}{unit}", RingLabelBrush);
+            // Outside the ring on the right; inside it when that would cross the map edge.
+            double x = center.X + radius + 3;
+            if (x + ft.Width > _clipRect.Right)
+            {
+                x = center.X + radius - 3 - ft.Width;
+            }
+            // Inside a small ring the label would sit on the self marker and
+            // arrow (17px), e.g. when an overview pushes self to the right edge.
+            // A ring that runs past the map edge has no room on either side.
+            bool clearOfSelf = x >= center.X + 17 && x + ft.Width <= _clipRect.Right;
+            double minY = _clipRect.Top + 1;
+            double y = Math.Clamp(center.Y - 8, minY, Math.Max(minY, _clipRect.Bottom - 1 - ft.Height));
+            if (clearOfSelf && x >= lastLabelRight + 3)
+            {
+                var bounds = DrawText(dc, ft, new Point(x, y));
+                lastLabelRight = bounds.Right;
+                RingLabelBoundsForTest?.Add(bounds);
+            }
         }
     }
 
@@ -262,7 +359,7 @@ internal sealed class RadarCanvas : FrameworkElement
         switch (entity.Kind)
         {
             case RadarEntityKind.Gimmick:
-                var gimmickPen = new Pen(WithOpacity(GimmickBrush, entity.Opacity), 1.5);
+                var gimmickPen = WithOpacity(GimmickBrush, entity.Opacity, 1.5);
                 dc.DrawLine(gimmickPen, new Point(point.X, point.Y - 5), new Point(point.X + 5, point.Y));
                 dc.DrawLine(gimmickPen, new Point(point.X + 5, point.Y), new Point(point.X, point.Y + 5));
                 dc.DrawLine(gimmickPen, new Point(point.X, point.Y + 5), new Point(point.X - 5, point.Y));
@@ -292,20 +389,54 @@ internal sealed class RadarCanvas : FrameworkElement
     {
         if (!string.IsNullOrWhiteSpace(label))
         {
-            DrawText(dc, label, new Point(point.X + 9, point.Y - 8), WithOpacity(LabelBrush, opacity), strong: strong);
+            var ft = CreateText(label, WithOpacity(LabelBrush, opacity), strong);
+            // Flip to the left of the marker at the right edge; keep the text box inside the map vertically.
+            double x = point.X + 9;
+            if (x + ft.Width > _clipRect.Right - 2)
+            {
+                x = point.X - 9 - ft.Width;
+            }
+            // A name wider than either side still starts inside the map.
+            x = Math.Max(x, _clipRect.Left + 1);
+            double minY = _clipRect.Top + 1;
+            double y = Math.Clamp(point.Y - 8, minY, Math.Max(minY, _clipRect.Bottom - 1 - ft.Height));
+            DrawText(dc, ft, new Point(x, y));
         }
     }
 
-    private void DrawText(DrawingContext dc, string text, Point point, Brush brush, bool centered = false,
-        bool strong = false)
+    private LabelText CreateText(string text, Brush brush, bool strong = false)
     {
-        var ft = new FormattedText(text, CultureInfo.CurrentUICulture, FlowDirection.LeftToRight,
-            strong ? StrongLabelTypeface : LabelTypeface, 11, brush, VisualTreeHelper.GetDpi(this).PixelsPerDip);
+        var key = (text, strong, brush);
+        if (_texts.TryGetValue(key, out var ft))
+        {
+            return ft;
+        }
+        if (!_textsBefore.Remove(key, out ft))
+        {
+            ft = new LabelText(new FormattedText(text, CultureInfo.CurrentUICulture, FlowDirection.LeftToRight,
+                strong ? StrongLabelTypeface : LabelTypeface, 11, brush, _pixelsPerDip));
+        }
+        _texts[key] = ft;
+        return ft;
+    }
+
+    private Rect DrawText(DrawingContext dc, string text, Point point, Brush brush, bool centered = false)
+    {
+        return DrawText(dc, CreateText(text, brush), point, centered);
+    }
+
+    private Rect DrawText(DrawingContext dc, LabelText ft, Point point, bool centered = false)
+    {
         if (centered)
         {
             point = new Point(point.X - ft.Width * 0.5, point.Y - ft.Height * 0.5);
         }
-        dc.DrawText(ft, point);
+        dc.PushTransform(new TranslateTransform(point.X, point.Y));
+        dc.DrawDrawing(ft.Glyphs);
+        dc.Pop();
+        var bounds = new Rect(point, new Size(ft.Width, ft.Height));
+        LabelBoundsForTest?.Add(bounds);
+        return bounds;
     }
 
     private static Point WorldToScreen(Vector3 world, Vector3 origin, Point center, double pixelsPerUnit)
@@ -320,11 +451,37 @@ internal sealed class RadarCanvas : FrameworkElement
         return Math.Abs(point.X - center.X) <= radius && Math.Abs(point.Y - center.Y) <= radius;
     }
 
+    private static int OpacityStep(float opacity) =>
+        float.IsFinite(opacity) ? (int)MathF.Round(Math.Clamp(opacity, 0f, 1f) * 100f) : 100;
+
+    // Base brushes are frozen at full opacity, so step 100 is the brush itself.
     private static Brush WithOpacity(Brush brush, float opacity)
     {
-        var clone = brush.Clone();
-        clone.Opacity = Math.Clamp(opacity, 0f, 1f);
-        return clone;
+        int step = OpacityStep(opacity);
+        if (step == 100 && brush.Opacity == 1)
+        {
+            return brush;
+        }
+        if (!FadedBrushes.TryGetValue((brush, step), out var faded))
+        {
+            faded = brush.Clone();
+            faded.Opacity = step / 100.0;
+            faded.Freeze();
+            FadedBrushes[(brush, step)] = faded;
+        }
+        return faded;
+    }
+
+    private static Pen WithOpacity(Brush brush, float opacity, double thickness)
+    {
+        int step = OpacityStep(opacity);
+        if (!FadedPens.TryGetValue((brush, step, thickness), out var pen))
+        {
+            pen = new Pen(WithOpacity(brush, opacity), thickness);
+            pen.Freeze();
+            FadedPens[(brush, step, thickness)] = pen;
+        }
+        return pen;
     }
 
     private static float GetWorldUnitsPerMeter(RadarSettings settings)

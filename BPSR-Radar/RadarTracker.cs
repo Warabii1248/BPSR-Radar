@@ -47,7 +47,11 @@ internal sealed record RadarSnapshot(
     RadarEntitySnapshot? Self,
     RadarEntitySnapshot[] Party,
     RadarEntitySnapshot[] Players,
-    RadarEntitySnapshot[] Enemies);
+    RadarEntitySnapshot[] Enemies)
+{
+    // Independently filtered for the nearby-enemy window, before map filters.
+    public RadarEntitySnapshot[] NearbyEnemies { get; init; } = [];
+}
 
 // Merged port of TacticalMapManager + the small part of EncounterManager's
 // attribute accumulation that the map needs (name, type, hp, position).
@@ -85,8 +89,7 @@ internal static class RadarTracker
     // learned from packets are kept across sessions so entities already
     // present when capture starts can still be resolved.
     private static readonly ConcurrentDictionary<long, string> PersistentNames = new();
-    private static readonly string NameCachePath = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "BPSR-Radar", "namecache.json");
+    private static readonly string NameCachePath = Path.Combine(RadarSettings.DataDir, "namecache.json");
     private static int namesDirty;
     private static CancellationTokenSource? nameCacheCts;
 
@@ -157,7 +160,9 @@ internal static class RadarTracker
 
     public static long PositionDirectionCount => Interlocked.Read(ref positionDirectionCount);
 
-    // When the scene last changed, in unix ms. Zero until the first one.
+    // When the current world instance last changed, in unix ms. A scene-id
+    // change and a same-scene channel transfer both rebuild the entity set.
+    // Zero until the first one.
     public static long SceneChangedAtMs { get; private set; }
 
     // Published to the helper. It cannot see packets, so without this it has
@@ -181,27 +186,13 @@ internal static class RadarTracker
             uint sceneIdBefore = sceneId;
             sceneId = newSceneId;
             sceneName = GameDataTables.Scenes.TryGetValue((int)newSceneId, out var scene) ? scene.Name : "";
-            lock (DirectionLock)
-            {
-                Interlocked.Exchange(ref positionDirectionCount, 0);
-                lastPositionDirection = 0;
-            }
             // Recorded before the wipe, because what it wipes is the
             // question. If an AOI batch for the new scene arrives before this
             // notification does -- and it can, SetScene is driven by a social
             // packet that merely carries SceneData, not by the scene load --
             // then everything it just delivered is discarded here, and a
             // static entity like a training dummy never re-announces itself.
-            int cleared = Entities.Count;
-            int clearedLockable = 0;
-            foreach (var e in Entities.Values)
-            {
-                if (e.EntityType == EEntityType.EntMonster) clearedLockable++;
-            }
-            Entities.Clear();
-            lastPartyBatchTimestamp = 0;
-            partyExpiry = MinimumPartyExpiry;
-            hasSnapshot = false;
+            var (cleared, clearedLockable) = ClearWorldLocked();
             line = $"scene {sceneIdBefore}->{newSceneId} cleared={cleared} mon={clearedLockable}";
             // Read by EntityExport. Clearing the list here is what strands the
             // memory helper after a field transition: it cannot re-adopt the
@@ -214,6 +205,46 @@ internal static class RadarTracker
         // Outside the lock: this one appends to a file, and Sync is taken by
         // the UI snapshot ten times a second.
         if (line != null) TrackerLog.Write(line);
+    }
+
+    // WorldNtf.EnterScene is also sent when moving to another channel in the
+    // same map. Its scene id therefore does not change, but every AOI entity
+    // belongs to the old channel and must be discarded. PersistentNames stays
+    // intact: it is a uuid lookup cache, not the set rendered on the radar.
+    public static string ResetForWorldEntry()
+    {
+        string line;
+        lock (Sync)
+        {
+            var (cleared, clearedLockable) = ClearWorldLocked();
+            line = $"world entry scene={sceneId} cleared={cleared} mon={clearedLockable}";
+            SceneChangedAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        }
+        return line;
+    }
+
+    // Sync must be held. Shared by real scene transitions and same-scene
+    // channel transfers so they cannot drift into two subtly different reset
+    // policies.
+    private static (int Cleared, int Lockable) ClearWorldLocked()
+    {
+        lock (DirectionLock)
+        {
+            Interlocked.Exchange(ref positionDirectionCount, 0);
+            lastPositionDirection = 0;
+        }
+
+        int cleared = Entities.Count;
+        int clearedLockable = 0;
+        foreach (var e in Entities.Values)
+        {
+            if (e.EntityType == EEntityType.EntMonster) clearedLockable++;
+        }
+        Entities.Clear();
+        lastPartyBatchTimestamp = 0;
+        partyExpiry = MinimumPartyExpiry;
+        hasSnapshot = false;
+        return (cleared, clearedLockable);
     }
 
     public static void SetSelf(long uuid)
@@ -415,6 +446,7 @@ internal static class RadarTracker
                 tracked.Hp = hp;
                 tracked.MaxHp = maxHp;
                 tracked.HasHp = true;
+                tracked.HasCurrentHp = true;
             }
         }
     }
@@ -445,6 +477,27 @@ internal static class RadarTracker
 
             lastPartyBatchTimestamp = 0;
             partyExpiry = MinimumPartyExpiry;
+        }
+    }
+
+    // HP of one entity regardless of map filters and the nearby-list radius:
+    // the target overlay shows the lock wherever it is. Same "known" rule as
+    // the snapshot -- maximum HP alone is not enough.
+    public static bool TryGetHp(long uuid, out long hp, out long maxHp)
+    {
+        hp = 0;
+        maxHp = 0;
+        if (uuid == 0) return false;
+        lock (Sync)
+        {
+            if (!Entities.TryGetValue(uuid, out var entity) ||
+                !(entity.HasHp && entity.HasCurrentHp && entity.MaxHp > 0))
+            {
+                return false;
+            }
+            hp = entity.Hp;
+            maxHp = entity.MaxHp;
+            return true;
         }
     }
 
@@ -593,6 +646,11 @@ internal static class RadarTracker
             var party = new List<RadarEntitySnapshot>();
             var players = new List<RadarEntitySnapshot>();
             var enemies = new List<RadarEntitySnapshot>();
+            var nearbyEnemies = new List<RadarEntitySnapshot>();
+            float unitsPerMeter = settings.DistanceCalibrationComplete &&
+                float.IsFinite(settings.WorldUnitsPerMeter) && settings.WorldUnitsPerMeter > 0
+                ? settings.WorldUnitsPerMeter : 1f;
+            float nearbyRadius = settings.EffectiveEnemyListRadiusMeters * unitsPerMeter;
 
             string[] partyIncludes = ParseTerms(settings.PartyNameIncludes);
             string[] partyExcludes = ParseTerms(settings.PartyNameExcludes);
@@ -631,6 +689,20 @@ internal static class RadarTracker
                     continue;
                 }
 
+                // Unreceived HP looks the same as no HP: either kind disappears.
+                if (settings.HideEntitiesWithoutHp && !snapshot.HasHp)
+                {
+                    continue;
+                }
+
+                if (selfPosition.HasValue && float.IsFinite(snapshot.DistanceFromSelf) &&
+                    snapshot.DistanceFromSelf <= nearbyRadius &&
+                    kind is RadarEntityKind.Monster or RadarEntityKind.Elite or
+                        RadarEntityKind.Boss or RadarEntityKind.UnknownMonster)
+                {
+                    nearbyEnemies.Add(snapshot);
+                }
+
                 if (!KindEnabled(kind.Value, settings))
                 {
                     continue;
@@ -658,11 +730,26 @@ internal static class RadarTracker
                 self,
                 party.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase).ToArray(),
                 players.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase).ToArray(),
-                enemies.OrderBy(x => x.Kind).ThenBy(x => x.DistanceFromSelf).ToArray());
+                enemies.OrderBy(x => x.Kind).ThenBy(x => x.DistanceFromSelf).ToArray())
+            {
+                NearbyEnemies = SortNearby(nearbyEnemies, settings.EnemyListSort),
+            };
             lastSnapshotTimestamp = now;
             hasSnapshot = true;
             return cachedSnapshot;
         }
+    }
+
+    // Ties fall back to distance, then UUID, so rows do not swap between
+    // snapshots. The ratio is clamped like the list's HP bar.
+    private static RadarEntitySnapshot[] SortNearby(List<RadarEntitySnapshot> nearby, EnemyListSortMode mode)
+    {
+        var ordered = mode == EnemyListSortMode.HpRatio
+            ? nearby.OrderBy(x => x.HasHp ? 0 : 1)
+                .ThenBy(x => x.HasHp ? Math.Clamp((double)x.Hp / x.MaxHp, 0, 1) : 0)
+                .ThenBy(x => x.DistanceFromSelf)
+            : nearby.OrderBy(x => x.DistanceFromSelf);
+        return ordered.ThenBy(x => x.Uuid).ToArray();
     }
 
     private static TrackedEntity GetOrCreate(long uuid)
@@ -791,7 +878,7 @@ internal static class RadarTracker
             tracked.Name,
             tracked.Hp,
             tracked.MaxHp,
-            tracked.HasHp,
+            tracked.HasHp && tracked.HasCurrentHp && tracked.MaxHp > 0,
             distance,
             opacity);
     }
