@@ -251,6 +251,9 @@ public partial class EnemyListWindow : Window
         private static readonly Brush LockBrush = FrozenBrush(0xF1, 0xC7, 0x5B);
         private static readonly Brush HpBrush = FrozenBrush(0xD8, 0x5B, 0x64);
         private static readonly Brush HpTrackBrush = FrozenBrush(0x40, 0x4D, 0x52);
+        // The target overlay's name colours, fully opaque like all list text.
+        private static readonly Brush EliteBrush = KindBrush(RadarEntityKind.Elite);
+        private static readonly Brush BossBrush = KindBrush(RadarEntityKind.Boss);
         private static readonly Geometry ReticleGeometry = CreateReticleGeometry();
         private readonly TextBlock name = new() { TextTrimming = TextTrimming.CharacterEllipsis };
         private readonly TextBlock distance = new()
@@ -276,6 +279,7 @@ public partial class EnemyListWindow : Window
         private bool isTarget;
         private double lastRatio = double.NaN;
         private bool? lastHasHp;
+        private RadarEntityKind? lastKind;
 
         public Border Root { get; } = new()
         {
@@ -324,6 +328,16 @@ public partial class EnemyListWindow : Window
             string displayName = string.IsNullOrWhiteSpace(entity.Name)
                 ? S.T("Unknown enemy", "不明な敵") : entity.Name;
             SetText(name, displayName);
+            if (entity.Kind != lastKind)
+            {
+                // Other names inherit the window's text colour.
+                if (entity.Kind == RadarEntityKind.Elite) name.Foreground = EliteBrush;
+                else if (entity.Kind == RadarEntityKind.Boss) name.Foreground = BossBrush;
+                else name.ClearValue(TextBlock.ForegroundProperty);
+                name.FontWeight = entity.Kind is RadarEntityKind.Elite or RadarEntityKind.Boss
+                    ? FontWeights.Bold : FontWeights.Normal;
+                lastKind = entity.Kind;
+            }
             bool hasHp = entity.HasHp && entity.MaxHp > 0;
             SetText(distance, hasHp ? $"{distanceMeters:0.0} m" : $"HP — · {distanceMeters:0.0} m");
             double ratio = hasHp ? Math.Clamp((double)entity.Hp / entity.MaxHp, 0, 1) : 0;
@@ -358,6 +372,12 @@ public partial class EnemyListWindow : Window
             var brush = new SolidColorBrush(Color.FromRgb(red, green, blue));
             brush.Freeze();
             return brush;
+        }
+
+        private static Brush KindBrush(RadarEntityKind kind)
+        {
+            uint argb = TargetOverlayWindow.NameArgb(kind, 0xFF000000);
+            return FrozenBrush((byte)(argb >> 16), (byte)(argb >> 8), (byte)argb);
         }
 
         private static Geometry CreateReticleGeometry()
